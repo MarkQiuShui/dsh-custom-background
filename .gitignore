@@ -1,0 +1,9 @@
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
+.idea
+
+# 私人背景图：发布仓库不带个人图片。
+# image/ 目录会在上传时自动创建（index.js 的 mkdir）。
+image/

@@ -1,0 +1,6 @@
+# dsh-custom-background bundle layer: insert the plugin row.
+# The loader entry name must equal the package name so the client-module
+# scan can resolve exports["./client"].
+- insert:
+    - id: custom-background
+      name: dsh-custom-background

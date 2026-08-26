@@ -1,0 +1,61 @@
+{
+  "name": "dsh-custom-background",
+  "version": "0.1.0",
+  "description": "Minimal custom background plugin for the DeepSeek Harness Web GUI: background image/color, readability overlay, and translucent panels.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": false,
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-settings-general",
+        "@deepseek-ai/dsh-api-remotes"
+      ]
+    }
+  },
+  "author": "your-github-username <you@example.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/your-github-username/dsh-custom-background.git"
+  },
+  "bugs": {
+    "url": "https://github.com/your-github-username/dsh-custom-background/issues"
+  },
+  "homepage": "https://github.com/your-github-username/dsh-custom-background#readme",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "plugin",
+    "background",
+    "wallpaper",
+    "theme"
+  ],
+  "scripts": {
+    "check": "node --check index.js && node --check client.js",
+    "test": "node test/smoke.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "^25.0.1"
+  }
+}
