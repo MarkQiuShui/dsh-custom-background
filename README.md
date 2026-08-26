@@ -26,9 +26,6 @@ DeepSeek Harness Web GUI 自定义背景插件。安装后设置页会出现一�
 
 ```sh
 dsh plugin --profile web add github:MarkQiuShui/dsh-custom-background
-
-# 更安全：锁定 commit / tag（第三方代码会在你的机器上执行，建议锁定）
-dsh plugin --profile web add github:MarkQiuShui/dsh-custom-background#v0.1.0
 ```
 
 ### 本地开发安装
