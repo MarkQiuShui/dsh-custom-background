@@ -25,11 +25,10 @@ DeepSeek Harness Web GUI 自定义背景插件。安装后设置页会出现一�
 本插件是纯 JS、无构建步骤，git 安装后无需 `allowBuilds` 授权即可加载：
 
 ```sh
-# 将 <username> 换成仓库所属账号
-dsh plugin --profile web add github:<username>/dsh-custom-background
+dsh plugin --profile web add github:MarkQiuShui/dsh-custom-background
 
 # 更安全：锁定 commit / tag（第三方代码会在你的机器上执行，建议锁定）
-dsh plugin --profile web add github:<username>/dsh-custom-background#v0.1.0
+dsh plugin --profile web add github:MarkQiuShui/dsh-custom-background#v0.1.0
 ```
 
 ### 本地开发安装
@@ -62,26 +61,6 @@ pnpm dsh plugin --profile web add ./dsh-custom-background
 也可以手动把图片放进插件的 `image/` 目录，URL 填 `/dsh-custom-background/image/<文件名>`（新增/替换图片无需重启，刷新页面即可）。注意：`image/` 目录已在 `.gitignore` 中忽略，不会随仓库发布（上传功能会在首次上传时自动创建该目录）。
 
 "恢复默认"按钮会把所有字段清回默认值（重新继承 schema 默认）。
-
-## 发布到自己的 GitHub
-
-1. 在 GitHub 新建空仓库（如 `dsh-custom-background`），不要勾选自动生成 README/LICENSE；
-2. 在插件目录初始化并推送：
-
-```sh
-cd dsh-custom-background
-git init
-git add .
-git commit -m "feat: initial release"
-git branch -M main
-git remote add origin git@github.com:<username>/dsh-custom-background.git
-git push -u origin main
-git tag v0.1.0 && git push origin v0.1.0
-```
-
-3. 推送前记得把 `package.json` 里的 `author` / `repository` / `homepage` 从占位值改成你的真实信息；
-4. CI（语法检查 + 冒烟测试）会在 push 后自动运行；
-5. 可选：发布到 npm（`npm publish`，需先确认 `dsh-custom-background` 包名未被占用），之后可用 `dsh plugin add dsh-custom-background` 安装。
 
 ## 卸载
 

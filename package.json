@@ -34,15 +34,15 @@
       ]
     }
   },
-  "author": "your-github-username <you@example.com>",
+  "author": "MarkQiuShui",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/your-github-username/dsh-custom-background.git"
+    "url": "git+https://github.com/MarkQiuShui/dsh-custom-background.git"
   },
   "bugs": {
-    "url": "https://github.com/your-github-username/dsh-custom-background/issues"
+    "url": "https://github.com/MarkQiuShui/dsh-custom-background/issues"
   },
-  "homepage": "https://github.com/your-github-username/dsh-custom-background#readme",
+  "homepage": "https://github.com/MarkQiuShui/dsh-custom-background#readme",
   "keywords": [
     "deepseek-harness",
     "dsh",
