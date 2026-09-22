@@ -337,31 +337,58 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * The frame surfaces this plugin is allowed to tint, as
+     * [token, light-palette tone, dark-palette tone].
+     *
+     * Deliberately only these two: they are the two "walls" (the conversation
+     * floor and the sidebar) and no text is painted on them directly.
+     * Every other surface token keeps the theme's opaque value, because those
+     * tokens also back floating menus, popovers, modals, dock panels, cards,
+     * inputs and code-block banners — and `--dsw-alias-bg-layer-3` is even
+     * consumed as an inverted *text* color — so tinting them either shows the
+     * page through a floating surface (two texts stacked on each other, e.g.
+     * the 本轮用量 popover) or washes out solid-tone labels.
+     */
+    const FRAME_SURFACES = Object.freeze([
+      ['--dsw-alias-bg-base', 'bluish-00', 'bluish-950'],
+      ['--dsw-specific-sidebar-fill', 'bluish-50', 'bluish-900'],
+    ])
+
+    /**
+     * One frame surface at `percent` alpha, mixed from the theme's own static
+     * palette so each scheme keeps its real tone instead of a literal
+     * near-white / near-black guess (which also flattened the surface ladder).
+     * `!important` because the theme sheets declare the same tokens on the same
+     * element (and the theme presenter writes them inline): the plugin's two
+     * walls must not depend on stylesheet arrival order.
+     */
+    const surfaceDecl = (surface, mode, percent) => {
+      const [token, light, dark] = surface
+      const tone = mode === 'dark' ? dark : light
+      return '  ' + token + ': color-mix(in srgb, var(--dsw-static-neutral-'
+        + tone + ') ' + percent + '%, transparent) !important;'
+    }
+
+    /**
      * Compose the background stylesheet from the resolved settings:
-     *  - body: 背景图（可选）+ 覆盖层 + 底色；
-     *  - body / body[data-ds-dark-theme]: 把主要面板 token 换成带透明度的颜色，
-     *    让背景图从面板缝隙透出来（token 声明位置与 ui-theme 的
-     *    design-platform.css 一致）。
+     *  - body: the background image (optional) plus the readability overlay
+     *    and the base color;
+     *  - body / body[data-ds-dark-theme]: the two frame surfaces at the panel
+     *    alpha, declared where ui-theme's design-platform.css declares its
+     *    tokens, so the image shows through the walls while every floating
+     *    surface and text-bearing card stays opaque and legible.
      * Disabled → empty stylesheet (the host app's own background wins).
      */
     function buildCss(cfg) {
       if (!cfg.enabled) return ''
       const overlay = 'rgba(8, 10, 14, ' + cfg.overlayAlpha + ')'
-      const lightPanel = 'rgba(255, 255, 255, ' + cfg.panelAlpha + ')'
-      const darkPanel = 'rgba(13, 15, 19, ' + cfg.panelAlpha + ')'
+      const percent = Math.round(clamp(cfg.panelAlpha) * 100)
       const imageLayer = cfg.image
         ? 'linear-gradient(' + overlay + ', ' + overlay + '), url("' + cssString(cfg.image) + '")'
         : 'linear-gradient(' + overlay + ', ' + overlay + ')'
-      const panels = (panel) => [
-        '  --dsw-alias-bg-base: ' + panel + ';',
-        '  --dsw-alias-bg-layer-1: ' + panel + ';',
-        '  --dsw-alias-bg-layer-2: ' + panel + ';',
-        '  --dsw-alias-bg-layer-3: ' + panel + ';',
-        '  --dsw-alias-bg-overlay: ' + panel + ';',
-        '  --dsw-alias-bg-module-platform: ' + panel + ';',
-        '  --dsw-specific-menu: ' + panel + ';',
-        '  --dsw-specific-sidebar-fill: ' + panel + ';',
-      ].join('\n')
+      const surfaces = (mode) => FRAME_SURFACES
+        .map((surface) => surfaceDecl(surface, mode, percent))
+        .join('\n')
       return [
         'body {',
         '  background-color: ' + cfg.color + ' !important;',
@@ -370,12 +397,10 @@ window.__ModuleLoader__.load({
         '  background-position: center !important;',
         '  background-repeat: no-repeat !important;',
         '  background-attachment: fixed !important;',
-        '}',
-        'body {',
-        panels(lightPanel),
+        surfaces('light'),
         '}',
         'body[data-ds-dark-theme] {',
-        panels(darkPanel),
+        surfaces('dark'),
         '}',
       ].join('\n')
     }

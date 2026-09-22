@@ -49,7 +49,7 @@ pnpm dsh plugin --profile web add ./dsh-custom-background
 | 本地添加图片 | 从本机选择图片上传到插件 `image/` 目录，成功后自动填入 URL |
 | 底色 | 页面背景的最底层颜色。未设置图片时它就是背景主体色（被覆盖层压暗后显示）；图片加载失败/加载中/有透明区域时它是兜底色；面板半透明时它决定"透出来的那层"的颜色基调 |
 | 覆盖层透明度 | 压在图片之上的深色遮罩（0–100%），保证文字对比度 |
-| 面板透明度 | 侧边栏/聊天区等面板的透明程度（明暗主题各自取对应底色） |
+| 面板透明度 | **只影响两块"墙"**：主内容区地基与侧栏。取值越高字迹越清晰（≥90% 时几乎等同实色）；菜单、弹窗、卡片、输入框、代码块等浮动/承载文字的表面始终使用主题原实色，不受该值影响 |
 
 ### 本地上传
 
@@ -68,7 +68,10 @@ pnpm dsh plugin --profile web remove dsh-custom-background
 ## 说明与限制
 
 - 设置命名空间 `custom-background` 的 schema 是手写的最小实现（callable + `toJSON`），不依赖 `@deepseek-ai/dsh-settings` / `@deepseek-ai/schemastery`——从本插件目录解析不到这些包。客户端绑定 scope 时传入 `decode`，跳过 schema 反序列化。
-- 覆盖的是 `body` 背景与 `--dsw-alias-bg-*` / `--dsw-specific-sidebar-fill` 等 token；气泡、输入框等局部表面仍使用原实色以保证可读性。
+- 覆盖的是 `body` 背景（图/遮罩/底色）与**两个框架表面** token：`--dsw-alias-bg-base`（主内容区地基）与 `--dsw-specific-sidebar-fill`（侧栏），并只用主题自身的静态色阶（`--dsw-static-neutral-bluish-*`）按面板透明度混合，明暗主题各取各的色调。
+- 其余表面 token 一律保持主题原值，这是刻意的可读性边界：`--dsw-specific-menu`（浮层菜单，如「本轮用量」）、`--dsw-alias-bg-layer-2`（模态/浮窗/胶囊）、`--dsw-alias-bg-layer-3`（同时被当作**反白文字颜色**）、`--dsw-alias-bg-module-platform`（设置行/标签/输入行）、`--dsw-alias-bg-overlay`（叠加提亮层）若被改成半透明，会出现"弹层里的文字和下层正文叠在一起"以及"实心色块上的文字发灰发虚"。
+- 两个框架表面的声明带 `!important`：主题样式表在同一个元素上声明同名 token，且主题切换时 presenter 会写行内变量，插件不能依赖样式表加载顺序。
+- 由此带来一个预期内的取舍：设置抽屉（`--dsw-alias-bg-layer-2`）等模态表面不再透出背景图，换来的是这些面承载的文字保持原对比度。
 - 上传校验为扩展名白名单 + 8 MiB 上限 + 文件名净化/防穿越，适合本机个人使用；生产环境如需更严格校验请自行扩展。
 - 远程浏览器（非 loopback）下设置只读：控件会禁用，改动仅本次会话内生效（dsh 的设置 RPC 仅限本机）。
 - 第三方插件会在你的机器上执行代码：只安装源码可信的插件，并可用 `github:作者/仓库#commit` 锁定版本。

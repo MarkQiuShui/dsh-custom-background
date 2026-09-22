@@ -176,6 +176,47 @@ if (typeof face.setField !== 'function' || typeof face.reset !== 'function' || t
 const style = dom.window.document.head.querySelector('style[data-plugin="dsh-custom-background"]')
 if (!style) throw new Error('style missing')
 
+// ── stylesheet policy ────────────────────────────────────────────────────
+// Only the two frame walls may be tinted. A translucent menu/modal/card token
+// shows the page through floating text, and `--dsw-alias-bg-layer-3` is also
+// consumed as an inverted text color, so those must keep the theme's opaque
+// value.
+const TINTED = [
+  '--dsw-alias-bg-base: color-mix(in srgb, var(--dsw-static-neutral-bluish-00) 80%, transparent)',
+  '--dsw-specific-sidebar-fill: color-mix(in srgb, var(--dsw-static-neutral-bluish-50) 80%, transparent)',
+]
+const UNTOUCHED = [
+  '--dsw-specific-menu',
+  '--dsw-alias-bg-layer-1',
+  '--dsw-alias-bg-layer-2',
+  '--dsw-alias-bg-layer-3',
+  '--dsw-alias-bg-overlay',
+  '--dsw-alias-bg-module-platform',
+]
+for (const decl of TINTED) if (!style.textContent.includes(decl)) throw new Error('frame surface not tinted: ' + decl)
+for (const token of UNTOUCHED) if (style.textContent.includes(token)) throw new Error('token must stay opaque: ' + token)
+if (!style.textContent.includes('--dsw-alias-bg-base: color-mix(in srgb, var(--dsw-static-neutral-bluish-950) 80%, transparent)')) {
+  throw new Error('dark frame surface must use the dark palette tone')
+}
+for (const token of ['--dsw-alias-bg-base', '--dsw-specific-sidebar-fill']) {
+  if (!new RegExp(token + ': color-mix\\([^;]+\\) !important;').test(style.textContent)) {
+    throw new Error('frame surface override must be important: ' + token)
+  }
+}
+if (style.textContent.includes('rgba(255, 255, 255') || style.textContent.includes('rgba(13, 15, 19')) {
+  throw new Error('frame surfaces must derive from the theme palette, not literal near-white/near-black')
+}
+
+await scope.set('panelAlpha', 0.5)
+if (!style.textContent.includes('var(--dsw-static-neutral-bluish-00) 50%, transparent)')) {
+  throw new Error('panel alpha not applied to the frame surfaces')
+}
+await scope.set('panelAlpha', 0.8)
+
+await scope.set('enabled', false)
+if (style.textContent !== '') throw new Error('disabled plugin must emit no stylesheet')
+await scope.set('enabled', true)
+
 let fetchCalled = null
 globalThis.fetch = async (url, opts) => {
   fetchCalled = { url, opts }
