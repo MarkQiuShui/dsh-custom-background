@@ -1,9 +1,9 @@
 /**
  * Host half of dsh-custom-background.
  *
- * The Loader row (`name: dsh-custom-background`) resolves this module on the
- * Node side, which is also what lets the client-module scan pick up the
- * package's `dsh.client` declaration.
+ * The Loader row (`id: custom-background`, `name: dsh-custom-background`)
+ * resolves this module on the Node side, which is also what lets the
+ * client-module scan pick up the package's `dsh.client` declaration.
  *
  * Host-side jobs:
  *  1. Serve the plugin's `image/` directory over HTTP so the browser half can
@@ -12,25 +12,40 @@
  *     never plugin-owned assets).
  *  2. Accept local background image uploads: `POST /dsh-custom-background/upload`
  *     saves the raw body into `image/` and answers the public URL.
- *  3. Register the `custom-background` settings namespace so the Web Settings
- *     page offers a top-level section (设置 → 自定义背景) and persists its
- *     choices into the Host user-settings document ($DSH_HOME/settings.yaml).
+ *  3. Declare the plugin's live Config so the Loader row becomes the
+ *     `custom-background` settings namespace the browser half edits through
+ *     `ctx.configForms.get('custom-background')`.
  *
- * The schema is deliberately dependency-free: from this plugin's directory the
- * harness packages (@deepseek-ai/dsh-settings, @deepseek-ai/schemastery) are
- * not resolvable, so a small callable schema with `toJSON` is provided instead
- * of importing them. The client half passes a `decode` when binding the scope,
- * which bypasses client-side schema rehydration entirely.
+ * The settings namespace of a plugin IS its Loader entry id, and the settings
+ * service only projects fields marked `volatile` (`docs/subsystems/settings`);
+ * there is no `ctx.settings.register()` API and a non-volatile Config field
+ * never reaches a form or accepts a write. Writes land in the active profile's
+ * patch document via the config editor, so the background survives a restart.
  */
 import { existsSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { extname, join, normalize, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import Schema from '@deepseek-ai/schemastery'
 
 export const name = 'dsh-custom-background'
 
 /** Required services: the web route registry provided by dsh-web-app. */
 export const inject = ['webServer']
+
+/**
+ * Live Config of the `custom-background` Loader row — the persisted settings
+ * the browser half reads and writes. Every field is `volatile`, which is the
+ * harness's requirement for a field to appear in and accept edits from a
+ * settings form.
+ */
+export const Config = Schema.object({
+  enabled: Schema.boolean().default(true).volatile(),
+  image: Schema.string().default('').volatile(),
+  color: Schema.string().default('#0e1116').volatile(),
+  overlayAlpha: Schema.number().min(0).max(1).default(0.45).volatile(),
+  panelAlpha: Schema.number().min(0).max(1).default(0.8).volatile(),
+})
 
 /** URL prefix the browser half uses for background images. */
 const ROUTE_PREFIX = '/dsh-custom-background'
@@ -44,49 +59,6 @@ const IMAGE_DIR = normalize(fileURLToPath(new URL('./image/', import.meta.url)))
 /** Upload size cap: 8 MiB is plenty for a wallpaper. */
 const MAX_UPLOAD_BYTES = 8 * 1024 * 1024
 
-/** Settings namespace keyed by the browser section (must match client.js). */
-const NS = 'custom-background'
-
-/** Composition-layer defaults the settings schema resolves (mirrors client.js). */
-const DEFAULTS = Object.freeze({
-  enabled: true,
-  image: '',
-  color: '#0e1116',
-  overlayAlpha: 0.45,
-  panelAlpha: 0.8,
-})
-
-/** Clamp a number into the 0..1 range. */
-function clamp(value) {
-  return Math.min(1, Math.max(0, value))
-}
-
-/** Coerce any stored section into the plugin's five-field shape with defaults. */
-function normalizeSection(value) {
-  const raw = value !== null && typeof value === 'object' && !Array.isArray(value) ? value : {}
-  return {
-    enabled: typeof raw.enabled === 'boolean' ? raw.enabled : DEFAULTS.enabled,
-    image: typeof raw.image === 'string' ? raw.image : DEFAULTS.image,
-    color: typeof raw.color === 'string' ? raw.color : DEFAULTS.color,
-    overlayAlpha: typeof raw.overlayAlpha === 'number' && Number.isFinite(raw.overlayAlpha)
-      ? clamp(raw.overlayAlpha)
-      : DEFAULTS.overlayAlpha,
-    panelAlpha: typeof raw.panelAlpha === 'number' && Number.isFinite(raw.panelAlpha)
-      ? clamp(raw.panelAlpha)
-      : DEFAULTS.panelAlpha,
-  }
-}
-
-/**
- * Minimal settings schema: callable (settings provider resolves sections
- * through it) plus `toJSON` (the describe surface serializes it). The client
- * half binds with a `decode` and never rehydrates this envelope.
- */
-const schema = Object.assign(
-  (value) => normalizeSection(value),
-  { toJSON: () => ({ type: 'object', fields: {} }) },
-)
-
 const MIME = {
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
@@ -97,8 +69,9 @@ const MIME = {
 }
 
 /**
- * Plugin body: register the image route, the upload route, and the settings
- * namespace. All ride effects on this fiber, so unload / HMR removes them.
+ * Plugin body: register the image route, the upload route, and stand the
+ * generic Config page down (the browser half owns 设置 → 自定义背景). Routes
+ * ride effects on this fiber, so unload / HMR removes them.
  */
 export function apply(ctx) {
   ctx.effect(() => ctx.webServer.register({
@@ -115,12 +88,15 @@ export function apply(ctx) {
     handler: handleUpload,
   }), name + ': upload route')
 
-  // While a settings provider exists, register the namespace. The scoped
-  // proxy rebinds this.ctx to the caller's fiber, so disposal of this plugin
-  // releases the registration. Changes apply live (the browser re-renders the
-  // background on every committed section).
+  // The plugin ships its own settings section, so the settings provider must
+  // not also auto-generate a page for this entry. `configure` is keyed by the
+  // OWNER fiber, and a service reads `ctx` as its consumer's fiber — hence the
+  // explicit `ctx.fiber`.
   ctx.inject(['settings'], (settingsCtx) => {
-    settingsCtx.settings.register(NS, schema, { base: {} })
+    settingsCtx.effect(
+      () => settingsCtx.settings.configure({ auto: false }, ctx.fiber),
+      name + ': settings page policy',
+    )
   })
 }
 
@@ -250,7 +226,7 @@ async function handleUpload(req, res) {
     await mkdir(IMAGE_DIR, { recursive: true })
     await writeFile(target, body, { flag: 'wx' })
   } catch (error) {
-    if ((error && error.code === 'EEXIST')) {
+    if (error && error.code === 'EEXIST') {
       // Lost a race with another upload of the same name — retry once with a
       // timestamp prefix instead of failing the caller.
       stored = Date.now() + '-' + stored

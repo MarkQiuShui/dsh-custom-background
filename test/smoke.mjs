@@ -1,27 +1,34 @@
 /**
- * Publish-ready smoke test: syntax + host routes (upload/serve) + browser
- * half (settings section registration, live stylesheet, upload flow).
+ * Publish-ready smoke test: syntax + host routes (upload/serve) + host settings
+ * contract (volatile Config) + browser half (settings section registration, live
+ * stylesheet, upload flow, the URL field showing the uploaded path).
  *
  * Run from the repo root:
  *   npm run check
  *   npm test
  *
- * No network, no harness dependencies — jsdom is the only devDependency.
+ * jsdom + @deepseek-ai/schemastery are the only dependencies; no harness boot.
  */
 import { existsSync, readFileSync, rmSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { join } from 'node:path'
 import { JSDOM } from 'jsdom'
-import { apply as hostApply } from '../index.js'
+import Schema from '@deepseek-ai/schemastery'
+import { Config, apply as hostApply, inject as hostInject, name as hostName } from '../index.js'
 
 const IMAGE_DIR = join(import.meta.dirname, '..', 'image')
 
 // ══════════ Host half ══════════
+if (hostName !== 'dsh-custom-background') throw new Error('bad host plugin name')
+if (!hostInject.includes('webServer')) throw new Error('host half must inject webServer')
+
 const exact = new Map()
 const prefixes = new Map()
-let settingsReg = null
+let settingsPolicy = null
+const hostFiber = { uid: 1 }
 const hostCtx = {
   effect: (fn) => fn(),
+  fiber: hostFiber,
   webServer: {
     register: (r) => {
       if (r.kind === 'exact') { exact.set(r.path, r); return () => {} }
@@ -30,20 +37,102 @@ const hostCtx = {
     },
   },
   inject: (services, fn) => {
-    if (services.includes('settings')) {
-      fn({ settings: { register: (ns, schema, opts) => { settingsReg = { ns, schema, opts } } } })
-    }
+    if (!services.includes('settings')) return
+    fn({
+      effect: (fn2) => fn2(),
+      // Deliberately NO `register`: the harness settings service has no such
+      // method (its surface is configure/describe/update/replace/mutate), and
+      // calling one used to be exactly why nothing persisted.
+      settings: {
+        configure: (presentation, owner) => {
+          settingsPolicy = { presentation, owner }
+          return () => {}
+        },
+      },
+    })
   },
 }
 hostApply(hostCtx)
 
 if (!exact.has('/dsh-custom-background/upload')) throw new Error('upload route missing')
 if (!prefixes.has('/dsh-custom-background')) throw new Error('image route missing')
-if (settingsReg === null || settingsReg.ns !== 'custom-background') throw new Error('settings ns wrong')
-const defaults = settingsReg.schema({})
-const clamped = settingsReg.schema({ enabled: false, overlayAlpha: 5, panelAlpha: -2 })
-if (defaults.enabled !== true || defaults.overlayAlpha !== 0.45 || defaults.panelAlpha !== 0.8) throw new Error('schema defaults wrong')
-if (clamped.overlayAlpha !== 1 || clamped.panelAlpha !== 0) throw new Error('schema clamp wrong')
+if (settingsPolicy === null) throw new Error('settings page policy not configured')
+if (settingsPolicy.presentation.auto !== false) throw new Error('the plugin owns its page; auto page must stand down')
+if (settingsPolicy.owner !== hostFiber) throw new Error('settings.configure must be owned by the plugin fiber')
+
+// ── host settings contract ───────────────────────────────────────────────
+// The settings namespace of a plugin is its Loader entry id and only
+// `volatile` Config fields are projected into it. These two helpers are
+// copied verbatim from packages/settings/settings/src/schema.ts so the test
+// asserts against the harness's real projection rules.
+function plainSchema(node) {
+  const result = new Schema(node.toJSON())
+  const walk = (current) => {
+    delete current.meta.volatile
+    for (const child of Object.values(current.dict ?? {})) walk(child)
+    if (current.inner) walk(current.inner)
+  }
+  walk(result)
+  return result
+}
+function volatileForm(node) {
+  if (node.meta.volatile) return plainSchema(node)
+  if (node.type === 'object') {
+    const dict = Object.fromEntries(Object.entries(node.dict ?? {}).flatMap(([key, child]) => {
+      const field = volatileForm(child)
+      return field === undefined ? [] : [[key, field]]
+    }))
+    return Object.keys(dict).length === 0 ? undefined : Schema.object(dict)
+  }
+  return undefined
+}
+function isVolatilePath(node, path) {
+  if (node.meta.volatile) return true
+  const [key, ...rest] = path
+  const child = key === undefined ? undefined : node.dict?.[key]
+  return child !== undefined && isVolatilePath(child, rest)
+}
+function projectForm(node, value) {
+  if (node.type === 'object' && value !== null && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(node.dict ?? {}).flatMap(([key, child]) => {
+      const field = value[key]
+      return field === undefined ? [] : [[key, projectForm(child, field)]]
+    }))
+  }
+  return value
+}
+
+if (typeof Config !== 'function' || Config.type !== 'object') throw new Error('Config schema not exported')
+const FIELDS = ['enabled', 'image', 'color', 'overlayAlpha', 'panelAlpha']
+for (const field of FIELDS) {
+  const node = Config.dict?.[field]
+  if (node === undefined) throw new Error('Config field missing: ' + field)
+  if (node.meta?.volatile !== true) throw new Error('Config field must be volatile: ' + field)
+  if (!isVolatilePath(Config, [field])) throw new Error('field is not an editable settings path: ' + field)
+}
+if (isVolatilePath(Config, ['nope'])) throw new Error('unknown field must not be an editable settings path')
+
+const form = volatileForm(Config)
+if (form === undefined) throw new Error('volatileForm rejected the Config (no editable field)')
+if (Object.keys(form.dict ?? {}).join(',') !== FIELDS.join(',')) {
+  throw new Error('projected settings fields mismatch: ' + Object.keys(form.dict ?? {}).join(','))
+}
+// The wire schema the browser rehydrates must accept a stored section.
+const wireSchema = new Schema(form.toJSON())
+const defaults = { enabled: true, image: '', color: '#0e1116', overlayAlpha: 0.45, panelAlpha: 0.8 }
+wireSchema(defaults)
+const projected = projectForm(form, defaults)
+if (JSON.stringify(projected) !== JSON.stringify(defaults)) {
+  throw new Error('projectForm lost fields: ' + JSON.stringify(projected))
+}
+wireSchema({ ...defaults, image: '/dsh-custom-background/image/wall.png', overlayAlpha: 0, panelAlpha: 1 })
+
+// The browser half binds ctx.configForms.get(NS); NS must equal the Loader row
+// id from cordis.patch.yml or the namespace would never resolve.
+const patch = readFileSync(new URL('../cordis.patch.yml', import.meta.url), 'utf8')
+const rowId = /^\s*-\s*id:\s*(\S+)\s*$/m.exec(patch)?.[1]
+if (rowId === undefined) throw new Error('cordis.patch.yml has no entry id')
+if (rowId !== 'custom-background') throw new Error('unexpected Loader row id: ' + rowId)
 
 const server = createServer(async (req, res) => {
   const pathname = new URL(req.url ?? '/', 'http://x').pathname
@@ -108,7 +197,24 @@ const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', 
 globalThis.window = dom.window
 globalThis.document = dom.window.document
 
-const fakeReact = { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }) }
+// Minimal hook runtime standing in for React: state survives renders, setters
+// mark the pass dirty, and the render is retried until it settles — which is
+// how React handles a state update during render.
+let hookState = []
+let hookIndex = 0
+let hookDirty = false
+const fakeReact = {
+  createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
+  useState: (initial) => {
+    const index = hookIndex++
+    if (!(index in hookState)) hookState[index] = initial
+    return [hookState[index], (next) => {
+      if (hookState[index] !== next) hookDirty = true
+      hookState[index] = next
+    }]
+  },
+}
+
 let registration = null
 dom.window.__ModuleLoader__ = { load: (r) => { registration = r } }
 ;(0, eval)(await readFileSync(new URL('../client.js', import.meta.url), 'utf8'))
@@ -119,8 +225,15 @@ const exportsObj = registration.factory((spec) => {
   throw new Error('unexpected require: ' + spec)
 })
 if (exportsObj.name !== 'custom-background') throw new Error('bad plugin name')
+if (!exportsObj.inject.includes('configForms')) throw new Error('client half must inject configForms')
 
-let scopeState = { status: 'ready', value: { enabled: true, image: '', color: '#0e1116', overlayAlpha: 0.45, panelAlpha: 0.8 }, revision: 0, writable: true }
+let scopeState = {
+  status: 'ready',
+  value: { enabled: true, image: '', color: '#0e1116', overlayAlpha: 0.45, panelAlpha: 0.8 },
+  revision: 0,
+  writable: true,
+}
+let setAccepts = true
 const scopeListeners = new Set()
 const writes = []
 const scope = {
@@ -128,26 +241,30 @@ const scope = {
   subscribe: (fn) => { scopeListeners.add(fn); return () => scopeListeners.delete(fn) },
   set: async (field, value) => {
     writes.push(['set', field, value])
+    if (!setAccepts) return false
     scopeState = { ...scopeState, value: { ...scopeState.value, [field]: value }, revision: scopeState.revision + 1 }
     for (const fn of [...scopeListeners]) fn()
+    return true
   },
   unset: async (field) => {
     writes.push(['unset', field])
+    if (!setAccepts) return false
     const next = { ...scopeState.value }
     delete next[field]
     scopeState = { ...scopeState, value: next, revision: scopeState.revision + 1 }
     for (const fn of [...scopeListeners]) fn()
+    return true
   },
 }
 
 const localeRegs = []
 const slotInjects = []
 const sectionRegs = []
-let bindSpec = null
+let requestedNamespace = null
 const ctx = {
   effect: (fn) => fn(),
   locale: { register: (ns, dicts) => { localeRegs.push([ns, dicts]) }, bind: () => (k) => k },
-  settingsScope: { bind: (spec) => { bindSpec = spec; return scope } },
+  configForms: { get: (ns) => { requestedNamespace = ns; return scope } },
   slots: {
     inject: (name, factory) => { slotInjects.push([name, factory]) },
     register: (options, component) => { sectionRegs.push({ options, component }); return () => {} },
@@ -155,8 +272,10 @@ const ctx = {
 }
 exportsObj.apply(ctx)
 
+if (requestedNamespace !== rowId) {
+  throw new Error('client bound the wrong settings namespace: ' + String(requestedNamespace))
+}
 if (!localeRegs.some(([ns]) => ns === 'settings.customBackground')) throw new Error('locale not registered')
-if (bindSpec === null || bindSpec.namespace !== 'custom-background') throw new Error('scope not bound')
 if (!slotInjects.some(([name]) => name === 'settings.section')) throw new Error('top-level section slot missing')
 if (slotInjects.some(([name]) => name === 'settings.plugin.item')) throw new Error('old plugin.item card still present')
 
@@ -217,30 +336,70 @@ await scope.set('enabled', false)
 if (style.textContent !== '') throw new Error('disabled plugin must emit no stylesheet')
 await scope.set('enabled', true)
 
-let fetchCalled = null
-globalThis.fetch = async (url, opts) => {
-  fetchCalled = { url, opts }
-  return { ok: true, status: 200, json: async () => ({ ok: true, url: '/dsh-custom-background/image/up-' + tag + '.png' }) }
-}
-await face.uploadImage({ name: 'wall.png' })
-if (fetchCalled === null || !fetchCalled.url.startsWith('/dsh-custom-background/upload?name=')) throw new Error('upload fetch not called')
-if (!writes.some(([op, f, v]) => op === 'set' && f === 'image' && v.includes('up-' + tag))) throw new Error('image not set after upload')
-if (!style.textContent.includes('url("/dsh-custom-background/image/up-' + tag + '.png")')) throw new Error('style did not update')
-if (face.hooks.background.getSnapshot().uploadStatus !== 'ok') throw new Error('upload status not ok')
-
-globalThis.fetch = async () => { throw new Error('network down') }
-await face.uploadImage({ name: 'fail.png' })
-if (face.hooks.background.getSnapshot().uploadStatus !== 'error') throw new Error('upload failure status missing')
-
-const tree = section.component({
+// ── upload appends the stored URL to the image field and the stylesheet ───
+const sectionProps = () => ({
   useBackground: (sel) => sel(face.hooks.background.getSnapshot()),
   setField: face.setField,
   reset: face.reset,
   uploadImage: face.uploadImage,
   t: (k) => k,
-  close: () => {},
 })
-const flat = JSON.stringify(tree)
+function renderSection() {
+  for (let pass = 0; pass < 5; pass++) {
+    hookIndex = 0
+    hookDirty = false
+    const tree = section.component(sectionProps())
+    if (!hookDirty) return tree
+  }
+  throw new Error('section hooks did not settle')
+}
+function collect(node, out = []) {
+  if (node === null || typeof node !== 'object') return out
+  if (Array.isArray(node)) { for (const child of node) collect(child, out); return out }
+  if (typeof node.type === 'string') out.push(node)
+  for (const child of node.children ?? []) collect(child, out)
+  return out
+}
+const imageInput = () => collect(renderSection()).find((node) => node.type === 'input' && node.props.type === 'text')
+
+let fetchCalled = null
+const uploadedUrl = '/dsh-custom-background/image/up-' + tag + '.png'
+globalThis.fetch = async (url, opts) => {
+  fetchCalled = { url, opts }
+  return { ok: true, status: 200, json: async () => ({ ok: true, url: uploadedUrl }) }
+}
+await face.uploadImage({ name: 'wall.png' })
+if (fetchCalled === null || !fetchCalled.url.startsWith('/dsh-custom-background/upload?name=')) throw new Error('upload fetch not called')
+if (!writes.some(([op, f, v]) => op === 'set' && f === 'image' && v.includes('up-' + tag))) throw new Error('image not set after upload')
+if (!style.textContent.includes('url("' + uploadedUrl + '")')) throw new Error('style did not update')
+if (face.hooks.background.getSnapshot().uploadStatus !== 'ok') throw new Error('upload status not ok')
+// The URL field must SHOW the stored path (it used to be an uncontrolled
+// defaultValue, so the path never appeared).
+const shown = imageInput()
+if (shown === undefined || shown.props.value !== uploadedUrl) {
+  throw new Error('image field does not show the uploaded path: ' + JSON.stringify(shown?.props?.value))
+}
+// The field is the only writer on blur, and a manual URL commits too.
+shown.props.onChange({ target: { value: '  /custom/a b.png  ' } })
+const edited = imageInput()
+edited.props.onBlur()
+if (!writes.some(([op, f, v]) => op === 'set' && f === 'image' && v === '/custom/a b.png')) {
+  throw new Error('manual image URL was not committed trimmed')
+}
+
+// A Host that refuses the write must not be reported as an applied upload.
+setAccepts = false
+await face.uploadImage({ name: 'wall2.png' })
+setAccepts = true
+if (face.hooks.background.getSnapshot().uploadStatus !== 'unsaved') throw new Error('refused settings write must surface as unsaved')
+
+globalThis.fetch = async () => { throw new Error('network down') }
+await face.uploadImage({ name: 'fail.png' })
+const failure = face.hooks.background.getSnapshot()
+if (failure.uploadStatus !== 'error') throw new Error('upload failure status missing')
+if (typeof failure.uploadDetail !== 'string' || failure.uploadDetail === '') throw new Error('upload failure detail missing')
+
+const flat = JSON.stringify(renderSection())
 for (const key of ['title', 'enabled', 'image', 'upload', 'color', 'overlay', 'panel', 'reset']) {
   if (!flat.includes(key)) throw new Error('section missing label: ' + key)
 }

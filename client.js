@@ -7,7 +7,9 @@
  *
  * The factory runs once at materialization and returns the plugin exports
  * (name + inject + apply). apply():
- *  1. binds the `custom-background` settings scope,
+ *  1. binds the `custom-background` settings namespace through
+ *     `ctx.configForms.get(...)`, which mirrors the Loader row's volatile
+ *     Config (declared by the Host half's `Config` export),
  *  2. registers a TOP-LEVEL Settings section (设置 → 自定义背景, same nav
  *     level as 通用设置 / 插件) into the `settings.section` list slot,
  *  3. injects a plugin-owned <style> that re-renders whenever the settings
@@ -23,7 +25,7 @@ window.__ModuleLoader__.load({
   factory: (require) => {
     const module = { exports: {} }
     const exports = module.exports
-    const { createElement: h } = require('react')
+    const { createElement: h, useState } = require('react')
 
     const PLUGIN_ID = 'dsh-custom-background'
     const NS = 'custom-background'
@@ -67,6 +69,7 @@ window.__ModuleLoader__.load({
         uploading: '上传中…',
         uploadOk: '已上传',
         uploadError: '上传失败，请重试',
+        saveError: '图片已上传，但 Host 未接受设置写入（请检查当前连接是否只读）',
         color: '底色',
         overlay: '覆盖层透明度',
         panel: '面板透明度',
@@ -83,6 +86,7 @@ window.__ModuleLoader__.load({
         uploading: 'Uploading…',
         uploadOk: 'Uploaded',
         uploadError: 'Upload failed, please retry',
+        saveError: 'Image uploaded, but the Host refused the settings write (check whether this connection is read-only)',
         color: 'Base color',
         overlay: 'Overlay opacity',
         panel: 'Panel opacity',
@@ -95,7 +99,7 @@ window.__ModuleLoader__.load({
     exports.name = 'custom-background'
 
     /** Required services (same set ui-theme uses for settings rows). */
-    exports.inject = ['slots', 'locale', 'connection', 'remote', 'settingsScope']
+    exports.inject = ['slots', 'locale', 'connection', 'remote', 'configForms']
 
     exports.apply = (ctx) => {
       if (typeof document === 'undefined') return
@@ -103,17 +107,19 @@ window.__ModuleLoader__.load({
       ctx.effect(() => ctx.locale.register(LOCALE_NS, DICTS), PLUGIN_ID + ': settings dictionaries')
       const t = ctx.locale.bind(LOCALE_NS)
 
-      const scope = ctx.settingsScope.bind({ namespace: NS, decode: (value) => value })
+      const scope = ctx.configForms.get(NS)
 
       // ── observable over the resolved background settings + upload status ──
       // The section (hooks seat), the stylesheet, and the upload flow all
       // share this snapshot.
-      let uploadStatus = 'idle' // 'idle' | 'uploading' | 'ok' | 'error'
+      let uploadStatus = 'idle' // 'idle' | 'uploading' | 'ok' | 'error' | 'unsaved'
+      let uploadDetail = ''
       let snapshot = Object.freeze({
         value: Object.freeze({ ...DEFAULTS }),
         revision: -1,
         writable: false,
         uploadStatus,
+        uploadDetail,
       })
       const listeners = new Set()
       const observable = {
@@ -134,18 +140,21 @@ window.__ModuleLoader__.load({
           revision: snapshot.revision,
           writable: snapshot.writable,
           uploadStatus,
+          uploadDetail,
         })
         emit()
       }
       const derive = () => {
         const s = scope.getSnapshot()
         const status = uploadStatus
+        const detail = uploadDetail
         if (s.status === 'ready' && s.value !== undefined && s.value !== null) {
           snapshot = Object.freeze({
             value: Object.freeze(normalize(s.value)),
             revision: s.revision ?? -1,
             writable: s.writable === true,
             uploadStatus: status,
+            uploadDetail: detail,
           })
         } else {
           snapshot = Object.freeze({
@@ -153,6 +162,7 @@ window.__ModuleLoader__.load({
             revision: -1,
             writable: s.writable === true,
             uploadStatus: status,
+            uploadDetail: detail,
           })
         }
         emit()
@@ -187,6 +197,7 @@ window.__ModuleLoader__.load({
       const uploadImage = async (file) => {
         if (!file) return
         uploadStatus = 'uploading'
+        uploadDetail = ''
         publishStatus()
         try {
           const response = await fetch(UPLOAD_URL + '?name=' + encodeURIComponent(file.name), {
@@ -198,13 +209,22 @@ window.__ModuleLoader__.load({
           if (!response.ok || typeof data.url !== 'string') {
             throw new Error(data.error || 'HTTP ' + response.status)
           }
-          uploadStatus = 'ok'
-          publishStatus()
-          await scope.set('image', data.url)
-        } catch (_uploadFailure) {
+          // Scope.set answers whether the HOST accepted the write. It resolves
+          // false (without throwing) when the settings namespace is not
+          // writable — read-only connection, or an unavailable namespace — so
+          // a stored upload must not be reported as an applied background yet.
+          const accepted = await scope.set('image', data.url)
+          if (accepted === false) {
+            uploadStatus = 'unsaved'
+            uploadDetail = t('saveError')
+          } else {
+            uploadStatus = 'ok'
+          }
+        } catch (uploadFailure) {
           uploadStatus = 'error'
-          publishStatus()
+          uploadDetail = uploadFailure instanceof Error ? uploadFailure.message : String(uploadFailure)
         }
+        publishStatus()
       }
 
       // ── top-level settings section (设置 → 自定义背景) ─────────────────
@@ -231,10 +251,38 @@ window.__ModuleLoader__.load({
       const cfg = state.value
       const readOnly = !state.writable
       const status = state.uploadStatus
+      const detail = state.uploadDetail
       const statusText = status === 'uploading' ? t('uploading')
         : status === 'ok' ? t('uploadOk')
           : status === 'error' ? t('uploadError')
-            : ''
+            : status === 'unsaved' ? t('saveError')
+              : ''
+
+      // The URL and color fields keep a local draft: the persisted value lives
+      // in the Host document and only comes back after a round trip, while
+      // typing must not be undone by a re-render. The draft is re-seeded while
+      // rendering whenever the resolved value moves (an upload, a reset, or
+      // another window's edit) — React's documented "adjust state during
+      // render" pattern, so the field shows the new value in the same commit.
+      const [imageDraft, setImageDraft] = useState(cfg.image)
+      const [seededImage, setSeededImage] = useState(cfg.image)
+      if (seededImage !== cfg.image) {
+        setSeededImage(cfg.image)
+        setImageDraft(cfg.image)
+      }
+      const [colorDraft, setColorDraft] = useState(cfg.color)
+      const [seededColor, setSeededColor] = useState(cfg.color)
+      if (seededColor !== cfg.color) {
+        setSeededColor(cfg.color)
+        setColorDraft(cfg.color)
+      }
+      const commitImage = () => {
+        const next = imageDraft.trim()
+        if (next !== cfg.image) setField('image', next)
+      }
+      const commitColor = () => {
+        if (colorDraft !== cfg.color) setField('color', colorDraft)
+      }
 
       return h('div', { style: s.card },
         h('div', { style: s.title }, t('title')),
@@ -253,9 +301,12 @@ window.__ModuleLoader__.load({
           h('input', {
             type: 'text',
             style: s.input,
-            defaultValue: cfg.image,
+            value: imageDraft,
+            placeholder: '/dsh-custom-background/image/…',
             disabled: readOnly,
-            onBlur: (e) => { setField('image', e.target.value.trim()) },
+            onChange: (e) => { setImageDraft(e.target.value) },
+            onBlur: commitImage,
+            onKeyDown: (e) => { if (e.key === 'Enter') e.currentTarget.blur() },
           }),
         ),
         h('label', { style: s.row },
@@ -270,15 +321,18 @@ window.__ModuleLoader__.load({
               if (file) void uploadImage(file)
             },
           }),
-          statusText === '' ? null : h('span', { style: s.status }, statusText),
+          statusText === '' ? null : h('span', {
+            style: status === 'ok' ? s.status : s.statusError,
+          }, statusText + (detail === '' ? '' : '：' + detail)),
         ),
         h('label', { style: s.row },
           t('color'),
           h('input', {
             type: 'color',
-            defaultValue: cfg.color,
+            value: colorDraft,
             disabled: readOnly,
-            onBlur: (e) => { setField('color', e.target.value) },
+            onChange: (e) => { setColorDraft(e.target.value) },
+            onBlur: commitColor,
           }),
         ),
         h('label', { style: s.row },
@@ -325,6 +379,7 @@ window.__ModuleLoader__.load({
       row: { display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', flexWrap: 'wrap' },
       input: { flex: 1, minWidth: 0, padding: '4px 6px', fontSize: '13px' },
       status: { fontSize: '12px', opacity: 0.8 },
+      statusError: { fontSize: '12px', color: 'var(--dsw-alias-state-error-primary, #d92d20)' },
       hint: { fontSize: '12px', opacity: 0.65, lineHeight: 1.5 },
     }
 

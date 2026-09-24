@@ -10,7 +10,7 @@ DeepSeek Harness Web GUI 自定义背景插件。安装后设置页会出现一�
 | 文件 | 作用 |
 | --- | --- |
 | `package.json` | `dsh.client`（让 client-modules 发现浏览器 half）+ `dsh.bundle`（让 `dsh plugin add` 安装）+ 发布元信息 |
-| `index.js` | Node 半侧：`custom-background` 设置命名空间 + `/dsh-custom-background/image/*` 静态路由 + `POST /upload` 本地上传路由 |
+| `index.js` | Node 半侧：加载行（`id: custom-background`）的 volatile `Config`（即设置命名空间）+ `/dsh-custom-background/image/*` 静态路由 + `POST /upload` 本地上传路由 |
 | `client.js` | 浏览器 half：顶级设置菜单（`settings.section` 槽）+ 响应式背景样式 + 上传流程 |
 | `cordis.patch.yml` | 安装时插入 `custom-background` 插件行 |
 | `test/smoke.mjs` | 冒烟测试（Host 路由 + 浏览器注册/上传/样式），CI 执行 |
@@ -36,6 +36,8 @@ dsh plugin --profile web add github:MarkQiuShui/dsh-custom-background
 pnpm dsh plugin --profile web add ./dsh-custom-background
 ```
 
+> `link:` 安装不会替被链接的目录安装依赖，首次跑本地开发版前先在插件目录执行一次 `npm install`（装运行时依赖 `@deepseek-ai/schemastery`）。
+
 > 新插件进入组合需要**重启 dsh 进程**（client-modules 的包元数据按名称缓存，插件集合变化在重启后生效）。重启后刷新页面，设置页左侧会出现"自定义背景"菜单（位于 通用设置 与 插件 之间）。
 
 ## 使用
@@ -46,7 +48,7 @@ pnpm dsh plugin --profile web add ./dsh-custom-background
 | --- | --- |
 | 启用自定义背景 | 关闭后恢复应用默认背景 |
 | 背景图 URL | 留空 = 纯色背景 |
-| 本地添加图片 | 从本机选择图片上传到插件 `image/` 目录，成功后自动填入 URL |
+| 本地添加图片 | 从本机选择图片上传到插件 `image/` 目录；上传成功后 URL 输入框立即显示该路径，背景同步刷新 |
 | 底色 | 页面背景的最底层颜色。未设置图片时它就是背景主体色（被覆盖层压暗后显示）；图片加载失败/加载中/有透明区域时它是兜底色；面板半透明时它决定"透出来的那层"的颜色基调 |
 | 覆盖层透明度 | 压在图片之上的深色遮罩（0–100%），保证文字对比度 |
 | 面板透明度 | **只影响两块"墙"**：主内容区地基与侧栏。取值越高字迹越清晰（≥90% 时几乎等同实色）；菜单、弹窗、卡片、输入框、代码块等浮动/承载文字的表面始终使用主题原实色，不受该值影响 |
@@ -67,7 +69,8 @@ pnpm dsh plugin --profile web remove dsh-custom-background
 
 ## 说明与限制
 
-- 设置命名空间 `custom-background` 的 schema 是手写的最小实现（callable + `toJSON`），不依赖 `@deepseek-ai/dsh-settings` / `@deepseek-ai/schemastery`——从本插件目录解析不到这些包。客户端绑定 scope 时传入 `decode`，跳过 schema 反序列化。
+- 设置命名空间就是插件所在加载行的 id（`custom-background`），由 Host 半侧导出的 `Config`（`@deepseek-ai/schemastery`）投影而来；**只有带 `.volatile()` 的字段**才会进入设置表单并接受写入。`@deepseek-ai/schemastery` 是运行时依赖：`dsh plugin add`（pnpm）会随包安装，`link:` 本地安装不会替被链接目录装依赖，需要在插件目录先执行一次 `npm install`。
+- 字段写入由配置编辑器落到当前 profile 的 patch 文档（如 `profiles/web/cordis.patch.yml`），刷新 / 重启后依旧生效。插件自带设置页，所以 Host 半侧用 `ctx.settings.configure({ auto: false })` 关掉了自动生成页。
 - 覆盖的是 `body` 背景（图/遮罩/底色）与**两个框架表面** token：`--dsw-alias-bg-base`（主内容区地基）与 `--dsw-specific-sidebar-fill`（侧栏），并只用主题自身的静态色阶（`--dsw-static-neutral-bluish-*`）按面板透明度混合，明暗主题各取各的色调。
 - 其余表面 token 一律保持主题原值，这是刻意的可读性边界：`--dsw-specific-menu`（浮层菜单，如「本轮用量」）、`--dsw-alias-bg-layer-2`（模态/浮窗/胶囊）、`--dsw-alias-bg-layer-3`（同时被当作**反白文字颜色**）、`--dsw-alias-bg-module-platform`（设置行/标签/输入行）、`--dsw-alias-bg-overlay`（叠加提亮层）若被改成半透明，会出现"弹层里的文字和下层正文叠在一起"以及"实心色块上的文字发灰发虚"。
 - 两个框架表面的声明带 `!important`：主题样式表在同一个元素上声明同名 token，且主题切换时 presenter 会写行内变量，插件不能依赖样式表加载顺序。

@@ -55,6 +55,9 @@
     "check": "node --check index.js && node --check client.js",
     "test": "node test/smoke.mjs"
   },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.4"
+  },
   "devDependencies": {
     "jsdom": "^25.0.1"
   }
