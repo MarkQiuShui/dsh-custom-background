@@ -111,15 +111,22 @@ window.__ModuleLoader__.load({
 
       // ── observable over the resolved background settings + upload status ──
       // The section (hooks seat), the stylesheet, and the upload flow all
-      // share this snapshot.
+      // share this snapshot. `preview` carries slider positions the Host has
+      // not answered for yet (null = follow it).
+      const NO_PREVIEW = Object.freeze({ overlayAlpha: null, panelAlpha: null })
       let uploadStatus = 'idle' // 'idle' | 'uploading' | 'ok' | 'error' | 'unsaved'
       let uploadDetail = ''
+      let resolved = Object.freeze({ ...DEFAULTS })
+      let revision = -1
+      let writable = false
+      let preview = NO_PREVIEW
       let snapshot = Object.freeze({
-        value: Object.freeze({ ...DEFAULTS }),
-        revision: -1,
-        writable: false,
+        value: resolved,
+        revision,
+        writable,
         uploadStatus,
         uploadDetail,
+        preview,
       })
       const listeners = new Set()
       const observable = {
@@ -132,62 +139,99 @@ window.__ModuleLoader__.load({
       const emit = () => {
         for (const fn of [...listeners]) fn()
       }
-      const publishStatus = () => {
-        // Rebuild the snapshot so uploadStatus changes reach subscribers
-        // without waiting for the next scope round trip.
-        snapshot = Object.freeze({
-          value: snapshot.value,
-          revision: snapshot.revision,
-          writable: snapshot.writable,
-          uploadStatus,
-          uploadDetail,
-        })
+      const publish = () => {
+        snapshot = Object.freeze({ value: resolved, revision, writable, uploadStatus, uploadDetail, preview })
         emit()
       }
       const derive = () => {
         const s = scope.getSnapshot()
-        const status = uploadStatus
-        const detail = uploadDetail
         if (s.status === 'ready' && s.value !== undefined && s.value !== null) {
-          snapshot = Object.freeze({
-            value: Object.freeze(normalize(s.value)),
-            revision: s.revision ?? -1,
-            writable: s.writable === true,
-            uploadStatus: status,
-            uploadDetail: detail,
-          })
+          resolved = Object.freeze(normalize(s.value))
+          revision = s.revision ?? -1
         } else {
-          snapshot = Object.freeze({
-            value: Object.freeze({ ...DEFAULTS }),
-            revision: -1,
-            writable: s.writable === true,
-            uploadStatus: status,
-            uploadDetail: detail,
-          })
+          resolved = Object.freeze({ ...DEFAULTS })
+          revision = -1
         }
-        emit()
+        writable = s.writable === true
+        publish()
       }
       ctx.effect(() => scope.subscribe(derive), PLUGIN_ID + ': settings subscription')
       derive()
 
       // ── live background stylesheet ───────────────────────────────────
+      // Two update paths: the sheet text is rebuilt only when a structural
+      // setting moves (enabled / color / image), while the two alphas are
+      // inline custom properties — a drag touches two values and nothing else.
       ctx.effect(() => {
         const style = document.createElement('style')
         style.dataset.plugin = PLUGIN_ID
         style.dataset.pluginCss = PLUGIN_ID + '/background.css'
         document.head.appendChild(style)
-        const update = () => { style.textContent = buildCss(snapshot.value) }
+        let sheet = ''
+        const update = () => {
+          applyAlphas(snapshot.value, snapshot.preview)
+          const next = buildCss(snapshot.value)
+          if (next !== sheet) {
+            style.textContent = next
+            sheet = next
+          }
+        }
         const off = observable.subscribe(update)
         update()
         return () => {
           off()
           style.remove()
+          clearAlphas()
         }
       }, PLUGIN_ID + ': background stylesheet')
 
       // ── settings actions ─────────────────────────────────────────────
       const setField = (field, value) => { void scope.set(field, value) }
+
+      // A range input fires one event per pointer move, and every one of them
+      // used to become a settings write: the Host's config editor takes a file
+      // lock, rewrites the whole profile patch and reconciles the Loader, so
+      // writes queued up behind each other and the thumb lagged far behind the
+      // pointer. A drag now only moves `preview`; the settled value is written
+      // once, SLIDER_SETTLE_MS after the last move or as soon as the pointer
+      // is released.
+      const SLIDER_SETTLE_MS = 160
+      const sliderTimers = new Map()
+      const previewAlpha = (field, alpha) => {
+        preview = Object.freeze({ ...preview, [field]: alpha })
+        publish()
+        const pending = sliderTimers.get(field)
+        if (pending !== undefined) clearTimeout(pending)
+        sliderTimers.set(field, setTimeout(() => {
+          sliderTimers.delete(field)
+          commitAlpha(field)
+        }, SLIDER_SETTLE_MS))
+      }
+      const commitAlpha = (field) => {
+        const value = preview[field]
+        if (value === null) return
+        // The preview ends on the Host's answer for exactly this value: a
+        // newer drag step keeps its own, and a refused write (read-only Host)
+        // falls back to the persisted value exactly like an accepted one.
+        const settle = () => {
+          if (preview[field] !== value) return
+          preview = Object.freeze({ ...preview, [field]: null })
+          publish()
+        }
+        void scope.set(field, value).then(settle, settle)
+      }
+      const flushAlpha = (field) => {
+        const pending = sliderTimers.get(field)
+        if (pending === undefined) return
+        clearTimeout(pending)
+        sliderTimers.delete(field)
+        commitAlpha(field)
+      }
       const reset = () => {
+        for (const pending of sliderTimers.values()) clearTimeout(pending)
+        sliderTimers.clear()
+        preview = NO_PREVIEW
+        publish()
         void scope.unset('enabled')
         void scope.unset('image')
         void scope.unset('color')
@@ -198,7 +242,7 @@ window.__ModuleLoader__.load({
         if (!file) return
         uploadStatus = 'uploading'
         uploadDetail = ''
-        publishStatus()
+        publish()
         try {
           const response = await fetch(UPLOAD_URL + '?name=' + encodeURIComponent(file.name), {
             method: 'POST',
@@ -224,7 +268,7 @@ window.__ModuleLoader__.load({
           uploadStatus = 'error'
           uploadDetail = uploadFailure instanceof Error ? uploadFailure.message : String(uploadFailure)
         }
-        publishStatus()
+        publish()
       }
 
       // ── top-level settings section (设置 → 自定义背景) ─────────────────
@@ -235,7 +279,9 @@ window.__ModuleLoader__.load({
         order: 5,
         label: () => t('nav'),
         locale: LOCALE_NS,
-        inject: () => ({ hooks: { background: observable }, setField, reset, uploadImage }),
+        inject: () => ({
+          hooks: { background: observable }, setField, reset, uploadImage, previewAlpha, flushAlpha,
+        }),
       }, BackgroundSection))
     }
 
@@ -246,12 +292,16 @@ window.__ModuleLoader__.load({
      * no CSS modules.
      */
     function BackgroundSection(props) {
-      const { useBackground, setField, reset, uploadImage, t } = props
+      const { useBackground, setField, reset, uploadImage, previewAlpha, flushAlpha, t } = props
       const state = useBackground((s) => s)
       const cfg = state.value
       const readOnly = !state.writable
       const status = state.uploadStatus
       const detail = state.uploadDetail
+      // While a drag is in flight the thumb and its readout show the local
+      // preview; once the Host answers, `preview` is null again and the
+      // persisted value takes over with no visible step.
+      const alphaPercent = (field) => Math.round((state.preview[field] ?? cfg[field]) * 100)
       const statusText = status === 'uploading' ? t('uploading')
         : status === 'ok' ? t('uploadOk')
           : status === 'error' ? t('uploadError')
@@ -341,12 +391,15 @@ window.__ModuleLoader__.load({
             type: 'range',
             min: 0,
             max: 100,
-            value: Math.round(cfg.overlayAlpha * 100),
+            value: alphaPercent('overlayAlpha'),
             disabled: readOnly,
-            onChange: (e) => { setField('overlayAlpha', Number(e.target.value) / 100) },
+            onChange: (e) => { previewAlpha('overlayAlpha', Number(e.target.value) / 100) },
+            onPointerUp: () => { flushAlpha('overlayAlpha') },
+            onKeyUp: () => { flushAlpha('overlayAlpha') },
+            onBlur: () => { flushAlpha('overlayAlpha') },
           }),
           ' ',
-          Math.round(cfg.overlayAlpha * 100) + '%',
+          alphaPercent('overlayAlpha') + '%',
         ),
         h('label', { style: s.row },
           t('panel'),
@@ -354,12 +407,15 @@ window.__ModuleLoader__.load({
             type: 'range',
             min: 0,
             max: 100,
-            value: Math.round(cfg.panelAlpha * 100),
+            value: alphaPercent('panelAlpha'),
             disabled: readOnly,
-            onChange: (e) => { setField('panelAlpha', Number(e.target.value) / 100) },
+            onChange: (e) => { previewAlpha('panelAlpha', Number(e.target.value) / 100) },
+            onPointerUp: () => { flushAlpha('panelAlpha') },
+            onKeyUp: () => { flushAlpha('panelAlpha') },
+            onBlur: () => { flushAlpha('panelAlpha') },
           }),
           ' ',
-          Math.round(cfg.panelAlpha * 100) + '%',
+          alphaPercent('panelAlpha') + '%',
         ),
         h('div', { style: s.row },
           h('button', {
@@ -417,11 +473,15 @@ window.__ModuleLoader__.load({
      * element (and the theme presenter writes them inline): the plugin's two
      * walls must not depend on stylesheet arrival order.
      */
-    const surfaceDecl = (surface, mode, percent) => {
+    /** Inline custom properties carrying the two alphas (see `applyAlphas`). */
+    const OVERLAY_VAR = '--cb-overlay'
+    const PANEL_VAR = '--cb-panel'
+
+    const surfaceDecl = (surface, mode) => {
       const [token, light, dark] = surface
       const tone = mode === 'dark' ? dark : light
       return '  ' + token + ': color-mix(in srgb, var(--dsw-static-neutral-'
-        + tone + ') ' + percent + '%, transparent) !important;'
+        + tone + ') var(' + PANEL_VAR + '), transparent) !important;'
     }
 
     /**
@@ -432,19 +492,25 @@ window.__ModuleLoader__.load({
      *    alpha, declared where ui-theme's design-platform.css declares its
      *    tokens, so the image shows through the walls while every floating
      *    surface and text-bearing card stays opaque and legible.
-     * Disabled → empty stylesheet (the host app's own background wins).
+     * Both alphas are read from custom properties (`applyAlphas`), so moving a
+     * slider never rebuilds this sheet. Disabled → empty stylesheet (the host
+     * app's own background wins).
      */
     function buildCss(cfg) {
       if (!cfg.enabled) return ''
-      const overlay = 'rgba(8, 10, 14, ' + cfg.overlayAlpha + ')'
-      const percent = Math.round(clamp(cfg.panelAlpha) * 100)
+      const overlay = 'var(' + OVERLAY_VAR + ')'
       const imageLayer = cfg.image
         ? 'linear-gradient(' + overlay + ', ' + overlay + '), url("' + cssString(cfg.image) + '")'
         : 'linear-gradient(' + overlay + ', ' + overlay + ')'
       const surfaces = (mode) => FRAME_SURFACES
-        .map((surface) => surfaceDecl(surface, mode, percent))
+        .map((surface) => surfaceDecl(surface, mode))
         .join('\n')
       return [
+        // Registered with `inherits: false` so a slider drag dirties <body>
+        // alone instead of the whole app subtree, and with initial values so
+        // both declarations stay valid before the first inline write.
+        '@property ' + OVERLAY_VAR + ' { syntax: "<color>"; inherits: false; initial-value: rgba(8, 10, 14, 0.45); }',
+        '@property ' + PANEL_VAR + ' { syntax: "<percentage>"; inherits: false; initial-value: 80%; }',
         'body {',
         '  background-color: ' + cfg.color + ' !important;',
         '  background-image: ' + imageLayer + ' !important;',
@@ -458,6 +524,30 @@ window.__ModuleLoader__.load({
         surfaces('dark'),
         '}',
       ].join('\n')
+    }
+
+    /**
+     * Publish the two alphas as inline custom properties on <body>, an
+     * in-flight drag (preview) winning over the persisted value. This is the
+     * only DOM write a slider move performs: no stylesheet text, no re-parse,
+     * no style recalculation outside <body> (`inherits: false` above).
+     */
+    function applyAlphas(cfg, preview) {
+      const body = document.body
+      if (body === null) return
+      if (!cfg.enabled) return clearAlphas()
+      const overlay = 'rgba(8, 10, 14, ' + (preview.overlayAlpha ?? cfg.overlayAlpha) + ')'
+      const panel = Math.round(clamp(preview.panelAlpha ?? cfg.panelAlpha) * 100) + '%'
+      if (body.style.getPropertyValue(OVERLAY_VAR) !== overlay) body.style.setProperty(OVERLAY_VAR, overlay)
+      if (body.style.getPropertyValue(PANEL_VAR) !== panel) body.style.setProperty(PANEL_VAR, panel)
+    }
+
+    /** Drop the alpha variables (disabled plugin, teardown). */
+    function clearAlphas() {
+      const body = document.body
+      if (body === null) return
+      body.style.removeProperty(OVERLAY_VAR)
+      body.style.removeProperty(PANEL_VAR)
     }
 
     return module.exports

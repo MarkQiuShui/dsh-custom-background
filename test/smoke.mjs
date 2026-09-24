@@ -301,8 +301,8 @@ if (!style) throw new Error('style missing')
 // consumed as an inverted text color, so those must keep the theme's opaque
 // value.
 const TINTED = [
-  '--dsw-alias-bg-base: color-mix(in srgb, var(--dsw-static-neutral-bluish-00) 80%, transparent)',
-  '--dsw-specific-sidebar-fill: color-mix(in srgb, var(--dsw-static-neutral-bluish-50) 80%, transparent)',
+  '--dsw-alias-bg-base: color-mix(in srgb, var(--dsw-static-neutral-bluish-00) var(--cb-panel), transparent)',
+  '--dsw-specific-sidebar-fill: color-mix(in srgb, var(--dsw-static-neutral-bluish-50) var(--cb-panel), transparent)',
 ]
 const UNTOUCHED = [
   '--dsw-specific-menu',
@@ -314,7 +314,7 @@ const UNTOUCHED = [
 ]
 for (const decl of TINTED) if (!style.textContent.includes(decl)) throw new Error('frame surface not tinted: ' + decl)
 for (const token of UNTOUCHED) if (style.textContent.includes(token)) throw new Error('token must stay opaque: ' + token)
-if (!style.textContent.includes('--dsw-alias-bg-base: color-mix(in srgb, var(--dsw-static-neutral-bluish-950) 80%, transparent)')) {
+if (!style.textContent.includes('--dsw-alias-bg-base: color-mix(in srgb, var(--dsw-static-neutral-bluish-950) var(--cb-panel), transparent)')) {
   throw new Error('dark frame surface must use the dark palette tone')
 }
 for (const token of ['--dsw-alias-bg-base', '--dsw-specific-sidebar-fill']) {
@@ -326,14 +326,35 @@ if (style.textContent.includes('rgba(255, 255, 255') || style.textContent.includ
   throw new Error('frame surfaces must derive from the theme palette, not literal near-white/near-black')
 }
 
+// Both alphas ride inline custom properties, so a value change must not touch
+// the sheet text at all — that is what keeps a slider drag cheap. `inherits:
+// false` keeps the change from dirtying the whole app subtree.
+const bodyStyle = () => dom.window.document.body.style
+if (!style.textContent.includes('@property --cb-overlay { syntax: "<color>"; inherits: false;')) {
+  throw new Error('overlay alpha variable must be registered with inherits: false')
+}
+if (!style.textContent.includes('@property --cb-panel { syntax: "<percentage>"; inherits: false;')) {
+  throw new Error('panel alpha variable must be registered with inherits: false')
+}
+if (!style.textContent.includes('linear-gradient(var(--cb-overlay), var(--cb-overlay))')) {
+  throw new Error('overlay must be read from its custom property')
+}
 await scope.set('panelAlpha', 0.5)
-if (!style.textContent.includes('var(--dsw-static-neutral-bluish-00) 50%, transparent)')) {
-  throw new Error('panel alpha not applied to the frame surfaces')
+if (bodyStyle().getPropertyValue('--cb-panel') !== '50%') {
+  throw new Error('panel alpha not published as a custom property')
+}
+await scope.set('overlayAlpha', 0.25)
+if (bodyStyle().getPropertyValue('--cb-overlay') !== 'rgba(8, 10, 14, 0.25)') {
+  throw new Error('overlay alpha not published as a custom property')
 }
 await scope.set('panelAlpha', 0.8)
+await scope.set('overlayAlpha', 0.45)
 
 await scope.set('enabled', false)
 if (style.textContent !== '') throw new Error('disabled plugin must emit no stylesheet')
+if (dom.window.document.body.getAttribute('style') !== '') {
+  throw new Error('disabled plugin must drop the alpha variables')
+}
 await scope.set('enabled', true)
 
 // ── upload appends the stored URL to the image field and the stylesheet ───
@@ -342,6 +363,8 @@ const sectionProps = () => ({
   setField: face.setField,
   reset: face.reset,
   uploadImage: face.uploadImage,
+  previewAlpha: face.previewAlpha,
+  flushAlpha: face.flushAlpha,
   t: (k) => k,
 })
 function renderSection() {
@@ -404,6 +427,62 @@ for (const key of ['title', 'enabled', 'image', 'upload', 'color', 'overlay', 'p
   if (!flat.includes(key)) throw new Error('section missing label: ' + key)
 }
 if (!flat.includes('"type":"file"') && !flat.includes("type: 'file'")) throw new Error('file input missing')
+
+// ── the two alpha sliders preview locally and write once per gesture ─────
+// A range input fires one event per pointer move. Each of those used to be a
+// settings write, and the Host's config editor (file lock + whole-patch
+// rewrite + Loader reconcile) could not keep up, so the writes queued up and
+// the thumb lagged. A drag must now reach the DOM/CSS immediately and the Host
+// at most once.
+const ranges = () => collect(renderSection())
+  .filter((node) => node.type === 'input' && node.props.type === 'range')
+const first = ranges()
+if (first.length !== 2) throw new Error('expected two alpha sliders, got ' + first.length)
+if (first[0].props.value !== 45 || first[1].props.value !== 80) {
+  throw new Error('sliders must start at the persisted alphas: ' + first.map((node) => node.props.value).join(','))
+}
+for (const node of first) {
+  if (typeof node.props.onPointerUp !== 'function' || typeof node.props.onKeyUp !== 'function'
+    || typeof node.props.onBlur !== 'function') {
+    throw new Error('a slider must commit on release, key-up and blur')
+  }
+}
+
+writes.length = 0
+first[0].props.onChange({ target: { value: '20' } })
+const dragged = ranges()[0]
+if (dragged.props.value !== 20) throw new Error('slider did not follow the pointer')
+if (bodyStyle().getPropertyValue('--cb-overlay') !== 'rgba(8, 10, 14, 0.2)') {
+  throw new Error('a drag step must preview through the overlay custom property')
+}
+if (writes.length !== 0) throw new Error('a drag step must not write to the Host: ' + JSON.stringify(writes))
+if (style.textContent.includes('rgba(8, 10, 14, 0.2)')) {
+  throw new Error('a drag step must not rewrite the stylesheet')
+}
+
+// Releasing writes the settled value exactly once and ends the preview.
+dragged.props.onPointerUp()
+if (writes.length !== 1) throw new Error('release must write once: ' + JSON.stringify(writes))
+if (writes[0][0] !== 'set' || writes[0][1] !== 'overlayAlpha' || writes[0][2] !== 0.2) {
+  throw new Error('release wrote the wrong value: ' + JSON.stringify(writes[0]))
+}
+await new Promise((resolve) => setTimeout(resolve, 0))
+if (face.hooks.background.getSnapshot().preview.overlayAlpha !== null) {
+  throw new Error('the preview must end once the Host answered')
+}
+if (bodyStyle().getPropertyValue('--cb-overlay') !== 'rgba(8, 10, 14, 0.2)') {
+  throw new Error('the persisted value must keep the alpha after the echo')
+}
+
+// A drag that never gets a release still settles on its own.
+writes.length = 0
+ranges()[1].props.onChange({ target: { value: '30' } })
+if (bodyStyle().getPropertyValue('--cb-panel') !== '30%') throw new Error('panel drag must preview')
+if (writes.length !== 0) throw new Error('panel drag must not write yet')
+await new Promise((resolve) => setTimeout(resolve, 300))
+if (writes.length !== 1 || writes[0][1] !== 'panelAlpha' || writes[0][2] !== 0.3) {
+  throw new Error('the settle timer must write once: ' + JSON.stringify(writes))
+}
 
 writes.length = 0
 await face.reset()
