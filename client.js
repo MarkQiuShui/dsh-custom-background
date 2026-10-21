@@ -178,8 +178,19 @@ window.__ModuleLoader__.load({
         }
         const off = observable.subscribe(update)
         update()
+        // The scrim color depends on the scheme, and with `preference: system` the
+        // scheme flips under us when the OS theme changes — without this the
+        // page would keep a dark scrim on a now-light app until the next
+        // setting write. Observes one attribute on <body> only.
+        const themeObserver = typeof MutationObserver === 'function'
+          ? new MutationObserver(() => applyAlphas(snapshot.value, snapshot.preview))
+          : null
+        if (themeObserver !== null) {
+          themeObserver.observe(document.body, { attributes: true, attributeFilter: ['data-ds-dark-theme'] })
+        }
         return () => {
           off()
+          if (themeObserver !== null) themeObserver.disconnect()
           style.remove()
           clearAlphas()
         }
@@ -477,6 +488,25 @@ window.__ModuleLoader__.load({
     const OVERLAY_VAR = '--cb-overlay'
     const PANEL_VAR = '--cb-panel'
 
+    /**
+     * The readability scrim, per scheme. A single dark scrim is only correct on
+     * a dark page: with `preference: system` the desktop app follows the OS, so
+     * on a light system a dark scrim darkens the whole page while
+     * `--dsw-alias-label-primary` stays near-black on top of it — the veil eats
+     * contrast instead of protecting it. The light scrim lifts the page under
+     * dark text the same way the dark one lowers it under light text.
+     */
+    const OVERLAY_RGB = Object.freeze({ dark: '8, 10, 14', light: '255, 255, 255' })
+
+    /** Current scheme, read from the attribute ui-theme keeps on <body>. */
+    const isDarkTheme = () => {
+      const body = document.body
+      return body !== null && body.hasAttribute('data-ds-dark-theme')
+    }
+
+    /** The scrim color for the active scheme at `alpha`. */
+    const overlayColor = (alpha, dark) => 'rgba(' + (dark ? OVERLAY_RGB.dark : OVERLAY_RGB.light) + ', ' + alpha + ')'
+
     const surfaceDecl = (surface, mode) => {
       const [token, light, dark] = surface
       const tone = mode === 'dark' ? dark : light
@@ -509,7 +539,7 @@ window.__ModuleLoader__.load({
         // Registered with `inherits: false` so a slider drag dirties <body>
         // alone instead of the whole app subtree, and with initial values so
         // both declarations stay valid before the first inline write.
-        '@property ' + OVERLAY_VAR + ' { syntax: "<color>"; inherits: false; initial-value: rgba(8, 10, 14, 0.45); }',
+        '@property ' + OVERLAY_VAR + ' { syntax: "<color>"; inherits: false; initial-value: ' + overlayColor(0.45, true) + '; }',
         '@property ' + PANEL_VAR + ' { syntax: "<percentage>"; inherits: false; initial-value: 80%; }',
         'body {',
         '  background-color: ' + cfg.color + ' !important;',
@@ -536,7 +566,7 @@ window.__ModuleLoader__.load({
       const body = document.body
       if (body === null) return
       if (!cfg.enabled) return clearAlphas()
-      const overlay = 'rgba(8, 10, 14, ' + (preview.overlayAlpha ?? cfg.overlayAlpha) + ')'
+      const overlay = overlayColor(preview.overlayAlpha ?? cfg.overlayAlpha, isDarkTheme())
       const panel = Math.round(clamp(preview.panelAlpha ?? cfg.panelAlpha) * 100) + '%'
       if (body.style.getPropertyValue(OVERLAY_VAR) !== overlay) body.style.setProperty(OVERLAY_VAR, overlay)
       if (body.style.getPropertyValue(PANEL_VAR) !== panel) body.style.setProperty(PANEL_VAR, panel)

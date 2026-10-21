@@ -48,16 +48,22 @@ pnpm dsh plugin --profile web add ./dsh-custom-background
 | --- | --- |
 | 启用自定义背景 | 关闭后恢复应用默认背景 |
 | 背景图 URL | 留空 = 纯色背景 |
-| 本地添加图片 | 从本机选择图片上传到插件 `image/` 目录；上传成功后 URL 输入框立即显示该路径，背景同步刷新 |
+| 本地添加图片 | 从本机选择图片上传到 `$DSH_HOME/custom-background/image`；上传成功后 URL 输入框立即显示该路径，背景同步刷新 |
 | 底色 | 页面背景的最底层颜色。未设置图片时它就是背景主体色（被覆盖层压暗后显示）；图片加载失败/加载中/有透明区域时它是兜底色；面板半透明时它决定"透出来的那层"的颜色基调 |
 | 覆盖层透明度 | 压在图片之上的深色遮罩（0–100%），保证文字对比度 |
-| 面板透明度 | **只影响两块"墙"**：主内容区地基与侧栏。取值越高字迹越清晰（≥90% 时几乎等同实色）；菜单、弹窗、卡片、输入框、代码块等浮动/承载文字的表面始终使用主题原实色，不受该值影响 |
+| 面板透明度 | 影响两块"墙"（主内容区地基与侧栏）。取值越高字迹越清晰（≥90% 时几乎等同实色）。⚠️ 实际作用范围比"墙"更大，详见下方「面板透明度的真实边界」 |
+
+> ⚠️ **面板透明度的真实边界（重要）**：插件改的是 `--dsw-alias-bg-base` 与 `--dsw-specific-sidebar-fill`，而 `--dsw-alias-bg-base` 是全局共享的实色面 token，**并非只被"墙"消费**。当 `panelAlpha < 100%` 时它会一并透底，已知消费者包括：macOS 菜单背板、代码块吸顶 banner、提问卡片、压缩摘要吸顶按钮、队列停靠面板、终端 xterm viewport，以及 `AppFrame` 的多个框架层。把面板透明度调得很低（如 0.22）会让这些承载文字的表面一起变半透明，建议 ≥ 0.85。要彻底消除该泄漏需改为"直接给墙体元素画背景"，属后续重构。
 
 ### 本地上传
 
 点击"本地添加图片"选择文件即可（支持 `jpg/jpeg/png/gif/webp/svg`，上限 8 MiB）。上传通过 `POST /dsh-custom-background/upload` 完成，文件名会被净化、冲突时自动加时间戳，不会覆盖已有文件。
 
-也可以手动把图片放进插件的 `image/` 目录，URL 填 `/dsh-custom-background/image/<文件名>`（新增/替换图片无需重启，刷新页面即可）。注意：`image/` 目录已在 `.gitignore` 中忽略，不会随仓库发布（上传功能会在首次上传时自动创建该目录）。
+也可以手动把图片放进 `$DSH_HOME/custom-background/image`，URL 填 `/dsh-custom-background/image/<文件名>`（新增/替换图片无需重启，刷新页面即可；上传功能会在首次上传时自动创建该目录）。
+
+**为什么上传不写进插件目录**：桌面端 profile 从 tarball 安装到 `node_modules`，插件目录内的文件是 pnpm store 的硬链接，`pnpm install` 或插件更新会重建该目录——写在那里的壁纸会丢。存在 `$DSH_HOME` 下则与插件安装解耦。
+
+插件自带的 `image/` 目录仍然**可读**，作为回退根：仓库里随附的图片、以及旧版本写进插件目录的上传都还能访问，无需重新上传。查找顺序是「先 `$DSH_HOME`，再包内 `image/`」，同名时前者优先。
 
 "恢复默认"按钮会把所有字段清回默认值（重新继承 schema 默认）。
 
@@ -71,8 +77,11 @@ pnpm dsh plugin --profile web remove dsh-custom-background
 
 - 设置命名空间就是插件所在加载行的 id（`custom-background`），由 Host 半侧导出的 `Config`（`@deepseek-ai/schemastery`）投影而来；**只有带 `.volatile()` 的字段**才会进入设置表单并接受写入。`@deepseek-ai/schemastery` 是运行时依赖：`dsh plugin add`（pnpm）会随包安装，`link:` 本地安装不会替被链接目录装依赖，需要在插件目录先执行一次 `npm install`。
 - 字段写入由配置编辑器落到当前 profile 的 patch 文档（如 `profiles/web/cordis.patch.yml`），刷新 / 重启后依旧生效。插件自带设置页，所以 Host 半侧用 `ctx.settings.configure({ auto: false })` 关掉了自动生成页。
-- 覆盖的是 `body` 背景（图/遮罩/底色）与**两个框架表面** token：`--dsw-alias-bg-base`（主内容区地基）与 `--dsw-specific-sidebar-fill`（侧栏），并只用主题自身的静态色阶（`--dsw-static-neutral-bluish-*`）按面板透明度混合，明暗主题各取各的色调。
-- 其余表面 token 一律保持主题原值，这是刻意的可读性边界：`--dsw-specific-menu`（浮层菜单，如「本轮用量」）、`--dsw-alias-bg-layer-2`（模态/浮窗/胶囊）、`--dsw-alias-bg-layer-3`（同时被当作**反白文字颜色**）、`--dsw-alias-bg-module-platform`（设置行/标签/输入行）、`--dsw-alias-bg-overlay`（叠加提亮层）若被改成半透明，会出现"弹层里的文字和下层正文叠在一起"以及"实心色块上的文字发灰发虚"。
+- 覆盖的是 `body` 背景（图/遮罩/底色）与**两个 token**：`--dsw-alias-bg-base`（主内容区地基）与 `--dsw-specific-sidebar-fill`（侧栏），并只用主题自身的静态色阶（`--dsw-static-neutral-bluish-*`）按面板透明度混合，明暗主题各取各的色调。
+- **覆盖的 token 集合是封闭的**：只有上面这两个，冒烟测试会断言"被改写的 `--dsw-*` token 恰好是这两个"，新增第三个会直接测试失败，避免悄悄把壁纸透到新表面。
+- 但请注意 `--dsw-alias-bg-base` 的消费者远不止"墙"：该 token 从 `<body>` 向下继承，菜单背板、代码块 banner、提问卡片、终端 viewport 等都会跟着变半透明（完整清单见上文「面板透明度的真实边界」，也被抄录在 `test/smoke.mjs` 里）。这是当前实现的**已知边界**，不是有意设计。
+- 其余表面 token 一律保持主题原值：`--dsw-specific-menu`（浮层菜单，如「本轮用量」）、`--dsw-alias-bg-layer-2`（模态/浮窗/胶囊）、`--dsw-alias-bg-layer-3`（同时被当作**反白文字颜色**）、`--dsw-alias-bg-module-platform`（设置行/标签/输入行）、`--dsw-alias-bg-overlay`（叠加提亮层）若被改成半透明，会出现"弹层里的文字和下层正文叠在一起"以及"实心色块上的文字发灰发虚"。
+- **遮罩随主题分色**：深色主题用 `rgba(8, 10, 14, α)`，浅色主题用 `rgba(255, 255, 255, α)`。原因是桌面 profile 的 `ui-theme` 配置通常是 `preference: system`，跟随系统；若在浅色系统上仍用深色遮罩，整页会被压暗而文字仍是深色（`--dsw-alias-label-primary`），对比度反而崩坏。插件用 `MutationObserver` 监听 `body[data-ds-dark-theme]`，系统主题切换时遮罩立刻跟着换，无需等到下一次设置写入。
 - 两个框架表面的声明带 `!important`：主题样式表在同一个元素上声明同名 token，且主题切换时 presenter 会写行内变量，插件不能依赖样式表加载顺序。
 - 由此带来一个预期内的取舍：设置抽屉（`--dsw-alias-bg-layer-2`）等模态表面不再透出背景图，换来的是这些面承载的文字保持原对比度。
 - 上传校验为扩展名白名单 + 8 MiB 上限 + 文件名净化/防穿越，适合本机个人使用；生产环境如需更严格校验请自行扩展。

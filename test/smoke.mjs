@@ -9,13 +9,27 @@
  *
  * jsdom + @deepseek-ai/schemastery are the only dependencies; no harness boot.
  */
-import { existsSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { JSDOM } from 'jsdom'
 import Schema from '@deepseek-ai/schemastery'
-import { Config, apply as hostApply, inject as hostInject, name as hostName } from '../index.js'
 
+// Uploads land in $DSH_HOME/custom-background/image, so the run gets a
+// throwaway home — the developer's real wallpapers must never be touched, and
+// the assertions below must not depend on what is already installed there.
+const TEST_HOME = mkdtempSync(join(tmpdir(), 'dsh-cb-smoke-'))
+process.env.DSH_HOME = TEST_HOME
+const HOME_IMAGE_DIR = join(TEST_HOME, 'custom-background', 'image')
+// A failing assertion throws past the cleanup at the bottom of this file, so
+// the throwaway home is also removed on exit — otherwise every red run leaves
+// a temp directory behind.
+process.on('exit', () => { rmSync(TEST_HOME, { recursive: true, force: true }) })
+
+const { Config, apply: hostApply, inject: hostInject, name: hostName } = await import('../index.js')
+
+/** The package's own image/ — now a read-only fallback root, never a write target. */
 const IMAGE_DIR = join(import.meta.dirname, '..', 'image')
 
 // ══════════ Host half ══════════
@@ -29,6 +43,9 @@ const hostFiber = { uid: 1 }
 const hostCtx = {
   effect: (fn) => fn(),
   fiber: hostFiber,
+  // No `dshHomePath` resolver here on purpose: the plugin must fall back to
+  // $DSH_HOME on its own instead of assuming the Loader injected the service.
+  get: () => undefined,
   webServer: {
     register: (r) => {
       if (r.kind === 'exact') { exact.set(r.path, r); return () => {} }
@@ -150,7 +167,6 @@ const server = createServer(async (req, res) => {
 await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
 const base = 'http://127.0.0.1:' + server.address().port
 const tag = 'smoke-' + Date.now()
-const uploaded = []
 
 try {
   const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 1, 2, 3])
@@ -163,11 +179,36 @@ try {
   if (up.status !== 200 || !upJson.url || !upJson.url.endsWith(tag + '.png')) {
     throw new Error('upload failed: ' + JSON.stringify(upJson))
   }
-  uploaded.push(tag + '.png')
   const fetched = await fetch(base + upJson.url)
   if (fetched.status !== 200 || fetched.headers.get('content-type') !== 'image/png') {
     throw new Error('uploaded file not served')
   }
+  if (fetched.headers.get('x-content-type-options') !== 'nosniff') {
+    throw new Error('served image must carry x-content-type-options: nosniff')
+  }
+  // The upload must leave the installed package alone: a desktop profile
+  // installs from a tarball into node_modules, so anything written next to
+  // index.js is destroyed by the next pnpm install or plugin update.
+  if (!existsSync(join(HOME_IMAGE_DIR, tag + '.png'))) {
+    throw new Error('upload must land in $DSH_HOME/custom-background/image, not in the package')
+  }
+  if (existsSync(join(IMAGE_DIR, tag + '.png'))) {
+    throw new Error('upload must not write into the package image/ directory')
+  }
+  // The package's own image/ is still served as a read-only fallback, so
+  // wallpapers shipped with the repo and uploads made by older versions stay
+  // reachable without a re-upload.
+  const fallbackName = 'fallback-' + tag + '.png'
+  writeFileSync(join(IMAGE_DIR, fallbackName), png)
+  try {
+    const fallback = await fetch(base + '/dsh-custom-background/image/' + fallbackName)
+    if (fallback.status !== 200) throw new Error('package image/ must stay readable as a fallback root')
+  } finally {
+    rmSync(join(IMAGE_DIR, fallbackName), { force: true })
+  }
+  // Containment still holds across both roots.
+  const escape = await fetch(base + '/dsh-custom-background/image/..%2findex.js')
+  if (escape.status !== 404) throw new Error('path traversal must answer 404, got ' + escape.status)
 
   const up2 = await fetch(base + '/dsh-custom-background/upload?name=' + encodeURIComponent(tag + '.png'), {
     method: 'POST',
@@ -178,7 +219,6 @@ try {
   if (up2.status !== 200 || up2Json.url === upJson.url || !up2Json.url.includes('-')) {
     throw new Error('collision handling failed')
   }
-  uploaded.push(up2Json.url.split('/').pop())
 
   const bad = await fetch(base + '/dsh-custom-background/upload?name=x.exe', { method: 'POST', body: png })
   if (bad.status !== 400) throw new Error('expected 400 for bad ext')
@@ -196,6 +236,13 @@ try {
 const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', { url: 'http://localhost:3080/' })
 globalThis.window = dom.window
 globalThis.document = dom.window.document
+// The browser half reads the scheme through a MutationObserver on <body>; in
+// jsdom the constructor only exists on the window, so expose it the way a
+// browser's global scope does.
+globalThis.MutationObserver = dom.window.MutationObserver
+// The dark scheme is the default this file asserts against below; the scrim
+// section toggles to the light scheme and back.
+dom.window.document.body.setAttribute('data-ds-dark-theme', '')
 
 // Minimal hook runtime standing in for React: state survives renders, setters
 // mark the pass dirty, and the render is retried until it settles — which is
@@ -304,6 +351,24 @@ const TINTED = [
   '--dsw-alias-bg-base: color-mix(in srgb, var(--dsw-static-neutral-bluish-00) var(--cb-panel), transparent)',
   '--dsw-specific-sidebar-fill: color-mix(in srgb, var(--dsw-static-neutral-bluish-50) var(--cb-panel), transparent)',
 ]
+
+// ── the tint set is closed ──────────────────────────────────────────────
+// Only these two tokens may ever be overridden. The list is a snapshot, not a
+// guess: adding a third tint silently shows the wallpaper through whatever
+// else consumes that token, so it must be a deliberate edit here too.
+const TINT_SET = FRAME_TOKEN_NAMES()
+function FRAME_TOKEN_NAMES() {
+  const found = new Set()
+  for (const match of styleText().matchAll(/(--dsw-[a-z0-9-]+)\s*:/g)) found.add(match[1])
+  return [...found].sort()
+}
+if (TINT_SET.join(',') !== '--dsw-alias-bg-base,--dsw-specific-sidebar-fill') {
+  throw new Error('the tinted token set changed: ' + TINT_SET.join(','))
+}
+function styleText() {
+  const node = dom.window.document.head.querySelector('style[data-plugin="dsh-custom-background"]')
+  return node === null ? '' : node.textContent
+}
 const UNTOUCHED = [
   '--dsw-specific-menu',
   '--dsw-alias-bg-layer-1',
@@ -324,6 +389,31 @@ for (const token of ['--dsw-alias-bg-base', '--dsw-specific-sidebar-fill']) {
 }
 if (style.textContent.includes('rgba(255, 255, 255') || style.textContent.includes('rgba(13, 15, 19')) {
   throw new Error('frame surfaces must derive from the theme palette, not literal near-white/near-black')
+}
+
+// ── known consumers of --dsw-alias-bg-base ──────────────────────────────
+// This is the honest boundary of the "two walls" design, and it is recorded
+// rather than asserted away: --dsw-alias-bg-base is NOT a wall-only token. Its
+// value inherits from <body> into every one of these surfaces, so at
+// panelAlpha < 1 the following are all partially transparent today:
+//
+//   MenuSurface.module.css:47       macOS 菜单背板（为 backdrop-filter 提供不透明像素）
+//   markdown/CodeBlock.module.css:28  代码块吸顶 banner（语言标签 / 复制按钮）
+//   AskQuestionCard.module.css:11   提问卡片
+//   MessageItem.module.css:92       压缩摘要吸顶按钮（注释明确要求 opaque）
+//   QueueDock.module.css:161,193    队列停靠面板
+//   sidebar-terminal/terminal.module.css:2,4  终端 xterm viewport
+//   ui-layout/AppFrame.module.css:7,34,153,163,278  frame / centerCol / darwin 列 / bottomRow
+//   design-platform.css:281         body{background-color: var(--dsw-alias-bg-base)}
+//   InlineEditor:13, ImagePreview:9, HtmlBody:7, Browser:8,124, PlatformOverlay:7,
+//   OnboardingSurface:7, SkillRow:167, TrajectoryTable:1920, ToolRow:138,
+//   ReasoningRow:21, MarkdownText:299, dockkit:170,618
+//
+// Tightening this to "opaque everywhere" is the refactor that replaces the
+// token override with a background painted on the wall elements; it is not a
+// test change. Until then this block records the leak instead of hiding it.
+if (!style.textContent.includes('--dsw-alias-bg-base: color-mix')) {
+  throw new Error('bg-base is expected to be tinted until the wall refactor lands')
 }
 
 // Both alphas ride inline custom properties, so a value change must not touch
@@ -347,6 +437,30 @@ await scope.set('overlayAlpha', 0.25)
 if (bodyStyle().getPropertyValue('--cb-overlay') !== 'rgba(8, 10, 14, 0.25)') {
   throw new Error('overlay alpha not published as a custom property')
 }
+
+// ── the scrim follows the scheme ────────────────────────────────────────
+// A single dark scrim is only right on a dark page. With `preference: system`
+// the desktop app follows the OS, so on a light system a dark scrim darkens
+// the page while --dsw-alias-label-primary stays near-black on top of it.
+await scope.set('overlayAlpha', 0.35)
+const darkScrim = bodyStyle().getPropertyValue('--cb-overlay')
+dom.window.document.body.removeAttribute('data-ds-dark-theme')
+await scope.set('overlayAlpha', 0.36)
+const lightScrim = bodyStyle().getPropertyValue('--cb-overlay')
+if (!/^rgba\(8, 10, 14, 0\.\d+\)$/.test(darkScrim) || !/^rgba\(255, 255, 255, 0\.\d+\)$/.test(lightScrim)) {
+  throw new Error('scrim must be dark on dark and light on light: ' + darkScrim + ' / ' + lightScrim)
+}
+// A live OS theme flip must repaint the scrim without waiting for the next
+// settings write, because `preference: system` flips the attribute under us.
+dom.window.document.body.setAttribute('data-ds-dark-theme', '')
+await new Promise((resolve) => setTimeout(resolve, 0))
+const flipped = bodyStyle().getPropertyValue('--cb-overlay')
+if (!/^rgba\(8, 10, 14, 0\.36\)$/.test(flipped)) {
+  throw new Error('theme flip must repaint the scrim, got ' + flipped)
+}
+dom.window.document.body.removeAttribute('data-ds-dark-theme')
+await new Promise((resolve) => setTimeout(resolve, 0))
+dom.window.document.body.setAttribute('data-ds-dark-theme', '')
 await scope.set('panelAlpha', 0.8)
 await scope.set('overlayAlpha', 0.45)
 
@@ -488,10 +602,8 @@ writes.length = 0
 await face.reset()
 if (writes.filter(([op]) => op === 'unset').length !== 5) throw new Error('reset incomplete')
 
-// cleanup uploaded fixtures
-for (const name of uploaded) {
-  const p = join(IMAGE_DIR, name)
-  if (existsSync(p)) rmSync(p)
-}
+// cleanup uploaded fixtures — they live in the throwaway home, which is
+// removed whole, so nothing here can reach the developer's real wallpapers.
+rmSync(TEST_HOME, { recursive: true, force: true })
 
 console.log('ALL_SMOKE_CHECKS_OK')

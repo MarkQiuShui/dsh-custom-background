@@ -6,12 +6,15 @@
  * client-module scan pick up the package's `dsh.client` declaration.
  *
  * Host-side jobs:
- *  1. Serve the plugin's `image/` directory over HTTP so the browser half can
- *     reference local background images as `/dsh-custom-background/image/<file>`
- *     (the dsh web server otherwise only serves /api and /plugins/<id>/client.js,
- *     never plugin-owned assets).
+ *  1. Serve background images over HTTP so the browser half can reference one
+ *     as `/dsh-custom-background/image/<file>` (the dsh web server otherwise
+ *     only serves /api and /plugins/<id>/client.js, never plugin-owned assets).
  *  2. Accept local background image uploads: `POST /dsh-custom-background/upload`
- *     saves the raw body into `image/` and answers the public URL.
+ *     saves the raw body into `$DSH_HOME/custom-background/image` and answers
+ *     the public URL. Uploads live outside the installed package on purpose: a
+ *     desktop profile installs this plugin from a tarball into `node_modules`,
+ *     so anything written next to this file is destroyed by the next
+ *     `pnpm install` or plugin update.
  *  3. Declare the plugin's live Config so the Loader row becomes the
  *     `custom-background` settings namespace the browser half edits through
  *     `ctx.configForms.get('custom-background')`.
@@ -24,6 +27,7 @@
  */
 import { existsSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { extname, join, normalize, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import Schema from '@deepseek-ai/schemastery'
@@ -53,8 +57,47 @@ const ROUTE_PREFIX = '/dsh-custom-background'
 /** Exact route accepting local image uploads (POST). */
 const UPLOAD_PATH = ROUTE_PREFIX + '/upload'
 
-/** Absolute path of the plugin's image directory (this file's sibling). */
-const IMAGE_DIR = normalize(fileURLToPath(new URL('./image/', import.meta.url)))
+/** Path segments of the writable image directory below the Harness home. */
+const IMAGE_SUBDIR = ['custom-background', 'image']
+
+/** Absolute path of the package's own `image/` directory (read-only fallback). */
+const PLUGIN_IMAGE_DIR = normalize(fileURLToPath(new URL('./image/', import.meta.url)))
+
+/**
+ * Absolute path of the writable image directory: `$DSH_HOME/custom-background/image`.
+ *
+ * Resolution order matches the harness's own `resolveDshHome()`: the Loader's
+ * `dshHomePath` resolver (which honours a configured home), then `$DSH_HOME`,
+ * then `~/.dsh`. Resolved per call rather than once at load so a test — or a
+ * profile that changes its home mid-process — sees the current value.
+ */
+function imageDir(ctx) {
+  let resolver
+  try {
+    resolver = ctx !== null && typeof ctx === 'object' && typeof ctx.get === 'function'
+      ? ctx.get('dshHomePath')
+      : undefined
+  } catch {
+    resolver = undefined
+  }
+  if (typeof resolver === 'function') return normalize(resolver(...IMAGE_SUBDIR))
+  const configured = process.env.DSH_HOME
+  const home = configured !== undefined && configured.trim() !== ''
+    ? configured.trim()
+    : join(homedir(), '.dsh')
+  return normalize(join(home, ...IMAGE_SUBDIR))
+}
+
+/**
+ * Image roots in lookup order: the writable home directory first, then the
+ * package's bundled `image/`. The package root keeps wallpapers shipped with
+ * the repo and every upload made by versions that still wrote into the package
+ * readable after the move, so nothing has to be re-uploaded.
+ */
+function imageRoots(ctx) {
+  const dir = imageDir(ctx)
+  return dir === PLUGIN_IMAGE_DIR ? [dir] : [dir, PLUGIN_IMAGE_DIR]
+}
 
 /** Upload size cap: 8 MiB is plenty for a wallpaper. */
 const MAX_UPLOAD_BYTES = 8 * 1024 * 1024
@@ -74,10 +117,12 @@ const MIME = {
  * ride effects on this fiber, so unload / HMR removes them.
  */
 export function apply(ctx) {
+  // The roots are resolved per request, not captured here: a profile can point
+  // `dshHomePath` at another home while this fiber stays alive.
   ctx.effect(() => ctx.webServer.register({
     kind: 'prefix',
     path: ROUTE_PREFIX,
-    handler: serveImage,
+    handler: (req, res) => serveImage(req, res, ctx),
   }), name + ': image route')
 
   // Exact route wins over the prefix (webserver matches exact first), so
@@ -85,7 +130,7 @@ export function apply(ctx) {
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
     path: UPLOAD_PATH,
-    handler: handleUpload,
+    handler: (req, res) => handleUpload(req, res, ctx),
   }), name + ': upload route')
 
   // The plugin ships its own settings section, so the settings provider must
@@ -101,12 +146,13 @@ export function apply(ctx) {
 }
 
 /**
- * Serve one plugin-owned image: `/dsh-custom-background/image/<file>`.
+ * Serve one background image: `/dsh-custom-background/image/<file>`.
  * GET/HEAD only; unknown extensions, path traversal, and missing files answer
  * 404. Directory escape is blocked by both the `..` guard and the resolved
- * prefix containment check.
+ * prefix containment check. Each root is tried in turn, so an upload in the
+ * home directory wins over a same-named file shipped inside the package.
  */
-async function serveImage(req, res) {
+async function serveImage(req, res, ctx) {
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     res.writeHead(405)
     res.end()
@@ -126,8 +172,8 @@ async function serveImage(req, res) {
     return
   }
   const underImage = pathname.slice(ROUTE_PREFIX.length + 1)
-  // Only files directly under the plugin's image/ directory are served:
-  // /dsh-custom-background/image/<file> → <file> resolved inside IMAGE_DIR.
+  // Only files directly under an image root are served:
+  // /dsh-custom-background/image/<file> → <file> resolved inside one root.
   if (!underImage.startsWith('image/')) {
     res.writeHead(404)
     res.end()
@@ -140,34 +186,51 @@ async function serveImage(req, res) {
     res.end()
     return
   }
-  const base = IMAGE_DIR.endsWith(sep) ? IMAGE_DIR.slice(0, -sep.length) : IMAGE_DIR
-  const target = normalize(join(IMAGE_DIR, relative))
-  if (target !== base && !target.startsWith(base + sep)) {
-    res.writeHead(404)
-    res.end()
-    return
-  }
-  try {
-    const body = await readFile(target)
+  for (const root of imageRoots(ctx)) {
+    const target = resolveInside(root, relative)
+    if (target === null) continue
+    let body
+    try {
+      body = await readFile(target)
+    } catch {
+      // Missing here is the normal case for the fallback root — try the next.
+      continue
+    }
     res.writeHead(200, {
       'content-type': type,
+      // Uploads keep their name across replacements, so a stale wallpaper must
+      // not survive a reload behind a long-lived cache entry.
       'cache-control': 'no-cache',
+      'x-content-type-options': 'nosniff',
     })
     res.end(req.method === 'HEAD' ? undefined : body)
-  } catch {
-    res.writeHead(404)
-    res.end()
+    return
   }
+  res.writeHead(404)
+  res.end()
+}
+
+/**
+ * Resolve `relative` inside `root` and return the absolute path, or null when
+ * it escapes the directory. Containment is checked on the resolved path, so
+ * both `..` segments and absolute lookalikes are refused.
+ */
+function resolveInside(root, relative) {
+  const base = root.endsWith(sep) ? root.slice(0, -sep.length) : root
+  const target = normalize(join(root, relative))
+  if (target === base || !target.startsWith(base + sep)) return null
+  return target
 }
 
 /**
  * Accept one local background image: `POST /dsh-custom-background/upload?name=<file>`.
  * The body is the raw file bytes; the original filename only supplies the
  * extension — storage names are sanitized and collision-safe, so the client
- * can never write outside `image/` or overwrite an existing file.
- * Answers JSON `{ "url": "/dsh-custom-background/image/<stored>" }`.
+ * can never write outside the writable image directory or overwrite an
+ * existing file. Answers JSON
+ * `{ "url": "/dsh-custom-background/image/<stored>" }`.
  */
-async function handleUpload(req, res) {
+async function handleUpload(req, res, ctx) {
   if (req.method !== 'POST') {
     res.writeHead(405)
     res.end()
@@ -210,27 +273,43 @@ async function handleUpload(req, res) {
     return
   }
 
-  const base = IMAGE_DIR.endsWith(sep) ? IMAGE_DIR.slice(0, -sep.length) : IMAGE_DIR
-  let target = normalize(join(IMAGE_DIR, stored))
-  if (!target.startsWith(base + sep) || target === base) {
+  const dir = imageDir(ctx)
+  let target = resolveInside(dir, stored)
+  if (target === null) {
     fail(400, 'invalid filename')
     return
   }
-  // Collision-safe: never overwrite an existing file.
-  if (existsSync(target)) {
+  // Collision-safe: never overwrite an existing file. Both roots are checked,
+  // because a write to the home directory would otherwise shadow a same-named
+  // image that ships inside the package.
+  const taken = (name) => imageRoots(ctx).some((root) => {
+    const candidate = resolveInside(root, name)
+    return candidate !== null && existsSync(candidate)
+  })
+  if (taken(stored)) {
     stored = Date.now() + '-' + stored
-    target = normalize(join(IMAGE_DIR, stored))
+    target = resolveInside(dir, stored)
+    if (target === null) {
+      fail(400, 'invalid filename')
+      return
+    }
   }
   try {
-    // Ensure the image directory exists (a fresh clone may not carry it).
-    await mkdir(IMAGE_DIR, { recursive: true })
+    // The home directory is created on demand: a first upload on a fresh
+    // install must not fail because $DSH_HOME/custom-background is absent.
+    await mkdir(dir, { recursive: true })
     await writeFile(target, body, { flag: 'wx' })
   } catch (error) {
     if (error && error.code === 'EEXIST') {
       // Lost a race with another upload of the same name — retry once with a
       // timestamp prefix instead of failing the caller.
       stored = Date.now() + '-' + stored
-      target = normalize(join(IMAGE_DIR, stored))
+      const retry = resolveInside(dir, stored)
+      if (retry === null) {
+        fail(400, 'invalid filename')
+        return
+      }
+      target = retry
       try {
         await writeFile(target, body, { flag: 'wx' })
       } catch {
