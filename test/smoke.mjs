@@ -9,7 +9,7 @@
  *
  * jsdom + @deepseek-ai/schemastery are the only dependencies; no harness boot.
  */
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -198,7 +198,11 @@ try {
   // The package's own image/ is still served as a read-only fallback, so
   // wallpapers shipped with the repo and uploads made by older versions stay
   // reachable without a re-upload.
+  //
+  // image/ is gitignored, so a fresh clone (every CI run) has no such
+  // directory at all — the fixture has to create it first.
   const fallbackName = 'fallback-' + tag + '.png'
+  mkdirSync(IMAGE_DIR, { recursive: true })
   writeFileSync(join(IMAGE_DIR, fallbackName), png)
   try {
     const fallback = await fetch(base + '/dsh-custom-background/image/' + fallbackName)
